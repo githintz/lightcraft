@@ -9,6 +9,9 @@ format: `docs/cloud-format.md`.
   drive) and `MemProvider` (tests, fault injection).
 - `ContentId` / `ObjectName`: blobs named by SHA-256, validated names that can't leave the app folder; `fetch_blob`
   verifies content against its id.
+- `crypto`: segmented AES-256-GCM blob encryption (file keys wrapped by the library's data key); `vault`: the data key
+  and account credentials under an Argon2id passphrase key; `manifest`: entries and replicas as an op log whose ops
+  merge in any order (per-field last writer wins), with snapshots.
 - `contract::check_provider`: the checks every provider passes (`tests/providers.rs`).
 
-No network code yet; no UI. Builds for wasm32.
+No UI yet. Builds for wasm32; randomness comes from the caller (`crypto::Random`; `OsRandom` on native).

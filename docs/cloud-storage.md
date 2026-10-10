@@ -1,6 +1,6 @@
 # Distributed cloud storage (proposal)
 
-**Status:** proposal, phase 1 of 7 in progress (core crate `crates/cloud`). Opt-in; nothing changes for a library
+**Status:** proposal; phase 1 (core crate `crates/cloud`) done, phase 2 (network providers) in progress. Opt-in; nothing changes for a library
 that doesn't turn it on. The local library stays the source of truth.
 
 LightCraft is local-first: no LightCraft account, no LightCraft server, no telemetry. This proposal keeps all three.
@@ -81,7 +81,7 @@ What each kind of file asks for by default:
 | Phase | Scope | Done when |
 |---|---|---|
 | **0. Format spec** | [`cloud-format.md`](cloud-format.md): blob naming, encryption, manifest; shared with Storage Distributor | Both projects reference one spec |
-| **1. Core crate** (in progress) | `crates/cloud`: availability, placement (+ ported tests), `Provider` trait, content-addressed blobs, folder + memory providers, contract checks. Next: encryption segments, vault, manifest types | Contract checks pass for every provider; no UI |
+| **1. Core crate** (done) | `crates/cloud`: availability, placement (+ ported tests), `Provider` trait, content-addressed blobs, folder + memory providers, contract checks, segmented AES-256-GCM blob encryption, the Argon2id passphrase vault, the manifest (per-field last-writer-wins merge, snapshots, op logs) | Contract checks pass for every provider; no UI |
 | **2. First network providers** | S3-compatible (B2, R2, MinIO for tests; SigV4 by hand), WebDAV (Nextcloud); then Google Drive, OneDrive, Dropbox with PKCE + loopback redirect (RFC 8252) | Contract checks pass against local test servers (MinIO, a WebDAV server) |
 | **3. Backup (one-way)** | Push originals, catalog snapshots and smart previews; restore a whole library on another machine. `cloud.connect`, `cloud.accounts`, `cloud.backup`, `cloud.restore`; Settings ▸ Cloud; Info ▸ "Stored on" | A library restored from the accounts alone matches the original |
 | **4. Offload originals** | Availability per album / photo; "Free up local space"; an offloaded original is fetched on demand while its smart preview is shown; ties into Missing Photos | Edit and export a photo whose original is only in the cloud |

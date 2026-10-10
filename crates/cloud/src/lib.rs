@@ -21,16 +21,21 @@
 mod availability;
 mod blob;
 pub mod contract;
+pub mod crypto;
 mod error;
 mod folder;
+pub mod manifest;
 mod memory;
 pub mod placement;
 mod provider;
+pub mod vault;
 
 pub use availability::{Availability, SpeedClass};
 pub use blob::{ContentId, ObjectName, fetch_blob, store_blob};
 pub use error::{CloudError, Result};
 pub use folder::FolderProvider;
+pub use manifest::{Entry, EntryKind, Manifest, Op, OpKind, Stamp};
 pub use memory::MemProvider;
 pub use placement::{PlacementAccount, PlacementError, PlacementRequest, Weights, choose, usable_free};
 pub use provider::{Listed, Provider, ProviderInfo, Quota, RemoteRef};
+pub use vault::{AccountSecret, Vault, VaultParams};

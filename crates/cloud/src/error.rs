@@ -17,6 +17,10 @@ pub enum CloudError {
     Corrupt(String),
     #[error("not supported: {0}")]
     Unsupported(String),
+    #[error("wrong passphrase (or a damaged vault)")]
+    WrongPassphrase,
+    #[error("the storage account refused access: {0}")]
+    Denied(String),
     #[error("storage error: {0}")]
     Io(String),
 }
