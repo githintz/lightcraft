@@ -1,6 +1,6 @@
 # Distributed cloud storage (proposal)
 
-**Status:** proposal; phase 1 (core crate `crates/cloud`) done, phase 2 (network providers) in progress. Opt-in; nothing changes for a library
+**Status:** proposal; phase 1 (core crate `crates/cloud`) done; phase 2 (network providers): S3-compatible and WebDAV done, consumer drives next. Opt-in; nothing changes for a library
 that doesn't turn it on. The local library stays the source of truth.
 
 LightCraft is local-first: no LightCraft account, no LightCraft server, no telemetry. This proposal keeps all three.
@@ -82,12 +82,28 @@ What each kind of file asks for by default:
 |---|---|---|
 | **0. Format spec** | [`cloud-format.md`](cloud-format.md): blob naming, encryption, manifest; shared with Storage Distributor | Both projects reference one spec |
 | **1. Core crate** (done) | `crates/cloud`: availability, placement (+ ported tests), `Provider` trait, content-addressed blobs, folder + memory providers, contract checks, segmented AES-256-GCM blob encryption, the Argon2id passphrase vault, the manifest (per-field last-writer-wins merge, snapshots, op logs) | Contract checks pass for every provider; no UI |
-| **2. First network providers** | S3-compatible (B2, R2, MinIO for tests; SigV4 by hand), WebDAV (Nextcloud); then Google Drive, OneDrive, Dropbox with PKCE + loopback redirect (RFC 8252) | Contract checks pass against local test servers (MinIO, a WebDAV server) |
+| **2. First network providers** (S3 and WebDAV done) | S3-compatible (`crates/cloud/src/s3.rs`: B2, R2, Wasabi, MinIO…; SigV4 written from the spec, checked against AWS's published examples and botocore), WebDAV (`crates/cloud/src/webdav.rs`: Nextcloud, ownCloud, NAS; basic auth only over https or to this computer). Next: Google Drive, OneDrive, Dropbox with PKCE + loopback redirect (RFC 8252); S3 multipart upload above 5 GiB | Contract checks pass against local test servers (moto for S3, WsgiDAV with and without auth) |
 | **3. Backup (one-way)** | Push originals, catalog snapshots and smart previews; restore a whole library on another machine. `cloud.connect`, `cloud.accounts`, `cloud.backup`, `cloud.restore`; Settings ▸ Cloud; Info ▸ "Stored on" | A library restored from the accounts alone matches the original |
 | **4. Offload originals** | Availability per album / photo; "Free up local space"; an offloaded original is fetched on demand while its smart preview is shown; ties into Missing Photos | Edit and export a photo whose original is only in the cloud |
 | **5. Several devices** | First one writer at a time (a remote lease next to `catalog.lock`: "checked out on MacBook"); later per-op device id + Lamport clock and per-op merge rules | Two machines take turns on one library; later edit at once |
 | **6. Web and tablet** | The web build opens the synced library (browser `fetch` transport; only CORS-friendly providers) | A tablet browses and edits a desktop library |
 | **7. Storage Distributor reads it** | The web app shows LightCraft's blobs in its drive view; optionally runs this crate as wasm | One implementation of the format |
+
+## Testing
+
+`cargo test -p lightcraft-cloud` runs everything offline: the provider contract against the memory and folder
+providers, SigV4 against fixed vectors, the HTTP client against a local echo server. `tests/live.rs` runs the same
+contract against real servers, only when one is configured:
+
+```sh
+LIGHTCRAFT_TEST_S3=http://127.0.0.1:5055 \
+LIGHTCRAFT_TEST_WEBDAV=http://127.0.0.1:8081/ \
+  cargo test -p lightcraft-cloud --test live
+```
+
+`LIGHTCRAFT_TEST_S3_KEY` / `_SECRET` / `_REGION` and `LIGHTCRAFT_TEST_WEBDAV_USER` / `_PASSWORD` set credentials. Any
+S3-compatible server works (MinIO, Garage, moto: `moto_server -p 5055`); any WebDAV server (WsgiDAV:
+`wsgidav --port 8081 --root <dir> --auth anonymous`). Each run writes to a fresh app folder.
 
 ## Risks
 

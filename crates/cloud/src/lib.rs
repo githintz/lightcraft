@@ -26,9 +26,15 @@ mod error;
 mod folder;
 pub mod manifest;
 mod memory;
+#[cfg(not(target_arch = "wasm32"))]
+mod net;
 pub mod placement;
 mod provider;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod s3;
 pub mod vault;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod webdav;
 
 pub use availability::{Availability, SpeedClass};
 pub use blob::{ContentId, ObjectName, fetch_blob, store_blob};

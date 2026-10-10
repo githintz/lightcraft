@@ -1,4 +1,4 @@
-//! A small HTTP/1.1 GET client for model downloads, in pure Rust: `std::net` sockets and, for
+//! A small HTTP/1.1 client for model downloads and storage accounts, in pure Rust: `std::net` sockets and, for
 //! `https://`, rustls with the RustCrypto provider (`rustls-rustcrypto`; no `ring` or
 //! `aws-lc-rs`, so nothing is compiled from C or assembly) and the Mozilla root certificates
 //! (`webpki-roots`).
@@ -168,8 +168,21 @@ fn is_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests on this thread trust only this certificate (a local test server's), never the
+    /// public roots.
+    static TEST_ROOT: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn tls_config() -> Result<Arc<rustls::ClientConfig>, HttpError> {
-    let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+    #[allow(unused_mut)]
+    let mut roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+    #[cfg(test)]
+    if let Some(der) = TEST_ROOT.with(|r| r.borrow().clone()) {
+        roots = rustls::RootCertStore::empty();
+        roots.add(rustls::pki_types::CertificateDer::from(der)).map_err(|e| HttpError::Tls(e.to_string()))?;
+    }
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls_rustcrypto::provider()))
         .with_safe_default_protocol_versions()
         .map_err(|e| HttpError::Tls(e.to_string()))?
@@ -254,8 +267,27 @@ impl Stream {
                 Ok(())
             }
             Stream::Tls(conn, sock) => {
-                // buffered by rustls, then sent as TLS records
-                conn.writer().write_all(data).map_err(|e| HttpError::Tls(e.to_string()))?;
+                // rustls buffers only so much (about 64 KiB) before it must be sent: hand it what
+                // it takes, send the TLS records, repeat. `write_all` would fail on the first
+                // refusal of a large body.
+                let mut rest = data;
+                let mut stuck = false;
+                while !rest.is_empty() {
+                    let n = conn.writer().write(rest).map_err(|e| HttpError::Tls(e.to_string()))?;
+                    rest = rest.get(n..).unwrap_or_default();
+                    let flushed = conn.wants_write();
+                    while conn.wants_write() {
+                        Self::retry(limits, || conn.write_tls(sock))?;
+                    }
+                    if n == 0 && !flushed {
+                        if stuck {
+                            return Err(HttpError::Tls("the secure connection accepts no more data".into()));
+                        }
+                        stuck = true;
+                    } else {
+                        stuck = false;
+                    }
+                }
                 while conn.wants_write() {
                     Self::retry(limits, || conn.write_tls(sock))?;
                 }
@@ -457,8 +489,18 @@ impl Response {
 
 /// Send `GET url` with extra `headers` and read the status line and headers.
 pub fn get(url: &Url, headers: &[(&str, String)], limits: &Limits) -> Result<Response, HttpError> {
+    request("GET", url, headers, &[], limits)
+}
+
+/// Send any request (`PUT`, `DELETE`, `PROPFIND`…) with extra `headers` and `body`, and read the
+/// status line and headers. A `Content-Length` is sent whenever there is a body and for `PUT` and
+/// `POST`; a `HEAD` response has no body.
+pub fn request(method: &str, url: &Url, headers: &[(&str, String)], body: &[u8], limits: &Limits) -> Result<Response, HttpError> {
+    if method.is_empty() || method.len() > 32 || !method.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Err(HttpError::BadUrl(format!("bad method {:?}", method.chars().take(32).collect::<String>())));
+    }
     let mut req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: LightCraft/{}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: LightCraft/{}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
         url.path,
         url.host_header(),
         env!("CARGO_PKG_VERSION")
@@ -469,9 +511,15 @@ pub fn get(url: &Url, headers: &[(&str, String)], limits: &Limits) -> Result<Res
         }
         req.push_str(&format!("{k}: {v}\r\n"));
     }
+    if !body.is_empty() || matches!(method, "PUT" | "POST") {
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
     req.push_str("\r\n");
     let mut stream = Stream::connect(url, limits)?;
     stream.write_all(req.as_bytes(), limits)?;
+    if !body.is_empty() {
+        stream.write_all(body, limits)?;
+    }
     let mut conn = Conn { stream, buf: Vec::new(), pos: 0 };
     let status_line = conn.line(MAX_HEAD, limits)?;
     let mut parts = status_line.split_whitespace();
@@ -496,7 +544,7 @@ pub fn get(url: &Url, headers: &[(&str, String)], limits: &Limits) -> Result<Res
         }
     }
     let find = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
-    let body = if status == 204 || status == 304 || (100..200).contains(&status) {
+    let body = if method == "HEAD" || status == 204 || status == 304 || (100..200).contains(&status) {
         BodyMode::Done
     } else if find("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
         BodyMode::Chunked { left: 0, done: false }
@@ -546,5 +594,145 @@ mod tests {
     #[test]
     fn the_tls_config_builds_with_the_pure_rust_provider() {
         assert!(tls_config().is_ok());
+    }
+
+    /// Answers each request with `<method> <path> <content-length header> <body bytes read>`;
+    /// a HEAD response announces a length but sends no body.
+    fn echo_server() -> String {
+        use std::io::{BufRead, BufReader};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut s in l.incoming().flatten() {
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let mut first = String::new();
+                r.read_line(&mut first).unwrap();
+                let mut len: Option<usize> = None;
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().ok();
+                    }
+                }
+                let mut body = vec![0; len.unwrap_or(0)];
+                r.read_exact(&mut body).unwrap();
+                let mut parts = first.split_whitespace();
+                let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                let reply = format!("{method} {path} {} {}", len.map_or("-".into(), |n| n.to_string()), body.len());
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.len());
+                s.write_all(head.as_bytes()).unwrap();
+                if method != "HEAD" {
+                    s.write_all(reply.as_bytes()).unwrap();
+                }
+            }
+        });
+        base
+    }
+
+    /// A self-signed P-256 certificate for 127.0.0.1 (valid until 2126) and its PKCS#8 key, made
+    /// with `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 36500
+    /// -addext subjectAltName=IP:127.0.0.1`. Test-only: it protects nothing.
+    const TEST_CERT: &str = "3082019a3082013fa00302010202140109203d1c4a560466e53239eeef6c1f4a33a45d300a06082a8648ce3d040302301a3118301606035504030c0f6c6967687463726166742d746573743020170d3236313031303134313133335a180f32313236303931363134313133335a301a3118301606035504030c0f6c6967687463726166742d746573743059301306072a8648ce3d020106082a8648ce3d030107034200047f337de439fadeb1de074ca911d6ade81a6d889a9dddda8b283bc31ba9b0763c7d718fdd29387add270463702ae87dcd9a06e846703d91681e79e8ee64055cf2a361305f301d0603551d0e041604143b383701c8f25c150f27d15ae07ab2c5b239a750301f0603551d230418301680143b383701c8f25c150f27d15ae07ab2c5b239a750300f0603551d110408300687047f000001300c0603551d130101ff04023000300a06082a8648ce3d0403020349003046022100adfb58b8430042eba07e91d22d435080ef17ca9e61d3ab950b5205992f087113022100f6d45f88b6af7405484f1720e220d5c151ceaa0e703c3eb3c8aeeebf8a684821";
+    const TEST_KEY: &str = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b0201010420703edf04ab1dc2bbc3618aab6381e62703643638d5cded552795ea4312fb03d0a144034200047f337de439fadeb1de074ca911d6ade81a6d889a9dddda8b283bc31ba9b0763c7d718fdd29387add270463702ae87dcd9a06e846703d91681e79e8ee64055cf2";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// A TLS server answering every request with the number of body bytes it received.
+    fn tls_count_server() -> String {
+        use std::io::{BufRead, BufReader};
+        let cert = rustls::pki_types::CertificateDer::from(unhex(TEST_CERT));
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(unhex(TEST_KEY).into());
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls_rustcrypto::provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let config = Arc::new(config);
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("https://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for sock in l.incoming().flatten() {
+                let conn = rustls::ServerConnection::new(config.clone()).unwrap();
+                let mut tls = BufReader::new(rustls::StreamOwned::new(conn, sock));
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if tls.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; len];
+                let ok = tls.read_exact(&mut body).is_ok();
+                let reply = format!("{} {}", body.len(), body.iter().map(|b| u64::from(*b)).sum::<u64>());
+                let reply = if ok { reply } else { "short".into() };
+                let mut s = tls.into_inner();
+                let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes());
+                s.conn.send_close_notify();
+                let _ = s.flush();
+            }
+        });
+        base
+    }
+
+    /// Bodies far larger than rustls buffers (about 64 KiB) arrive whole over TLS.
+    #[test]
+    fn large_bodies_over_tls() {
+        TEST_ROOT.with(|r| *r.borrow_mut() = Some(unhex(TEST_CERT)));
+        let base = tls_count_server();
+        let cancel = AtomicBool::new(false);
+        let limits = Limits { connect: Duration::from_secs(5), stall: Duration::from_secs(10), cancel: &cancel };
+        for size in [0usize, 1, 70_000, 3_000_000] {
+            let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let mut r = request("PUT", &Url::parse(&format!("{base}/x")).unwrap(), &[], &body, &limits).unwrap();
+            let mut buf = [0u8; 256];
+            let mut out = Vec::new();
+            loop {
+                let n = r.read(&mut buf, &limits).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            let sum: u64 = body.iter().map(|b| u64::from(*b)).sum();
+            assert_eq!(String::from_utf8(out).unwrap(), format!("{size} {sum}"));
+        }
+        TEST_ROOT.with(|r| *r.borrow_mut() = None);
+    }
+
+    #[test]
+    fn requests_with_any_method_and_body() {
+        let base = echo_server();
+        let cancel = AtomicBool::new(false);
+        let limits = Limits { connect: Duration::from_secs(5), stall: Duration::from_secs(5), cancel: &cancel };
+        let call = |method: &str, body: &[u8]| -> String {
+            let mut r = request(method, &Url::parse(&format!("{base}/x/y")).unwrap(), &[], body, &limits).unwrap();
+            let mut buf = [0u8; 256];
+            let mut out = Vec::new();
+            loop {
+                let n = r.read(&mut buf, &limits).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(call("PUT", &[7; 70_000]), "PUT /x/y 70000 70000");
+        assert_eq!(call("PUT", &[]), "PUT /x/y 0 0", "an empty PUT still says Content-Length: 0");
+        assert_eq!(call("DELETE", &[]), "DELETE /x/y - 0");
+        assert_eq!(call("PROPFIND", b"<x/>"), "PROPFIND /x/y 4 4");
+        assert_eq!(call("HEAD", &[]), "", "a HEAD response has no body to read");
+        for bad in ["", "get", "PUT /x", "A\r\nB"] {
+            assert!(matches!(request(bad, &Url::parse(&base).unwrap(), &[], &[], &limits), Err(HttpError::BadUrl(_))), "{bad:?}");
+        }
     }
 }

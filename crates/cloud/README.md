@@ -12,6 +12,8 @@ format: `docs/cloud-format.md`.
 - `crypto`: segmented AES-256-GCM blob encryption (file keys wrapped by the library's data key); `vault`: the data key
   and account credentials under an Argon2id passphrase key; `manifest`: entries and replicas as an op log whose ops
   merge in any order (per-field last writer wins), with snapshots.
+- `s3` (S3-compatible, SigV4 by hand) and `webdav` (RFC 4918, basic auth): network providers on `lightcraft-fetch`'s
+  pure-Rust HTTPS client, native only. Live tests: `docs/cloud-storage.md` → Testing.
 - `contract::check_provider`: the checks every provider passes (`tests/providers.rs`).
 
 No UI yet. Builds for wasm32; randomness comes from the caller (`crypto::Random`; `OsRandom` on native).
