@@ -33,6 +33,7 @@ lightcraft-engine = { path = "crates/engine" }
 lightcraft-ui-egui = { path = "crates/ui-egui" }
 lightcraft-mcp = { path = "crates/mcp" }
 lightcraft-fetch = { path = "crates/fetch" }
+lightcraft-cloud = { path = "crates/cloud" }
 lightcraft-heif = { path = "crates/heif" }
 lightcraft-segment = { path = "crates/segment" }
 

@@ -3024,6 +3024,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightcraft-cloud"
+version = "0.5.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "lightcraft-codecs"
 version = "0.5.0"
 dependencies = [
