@@ -98,6 +98,12 @@ fn server_message(body: &[u8]) -> String {
     }
 }
 
+/// This computer (`localhost`, `127.x.x.x`, `::1`): the one place credentials may go over plain
+/// `http://` (local test servers, a loopback redirect).
+pub fn is_local(host: &str) -> bool {
+    host == "localhost" || host == "::1" || host.starts_with("127.")
+}
+
 /// RFC 3986 percent-encoding of everything but unreserved characters (and `/` when `keep_slash`).
 pub fn uri_encode(s: &str, keep_slash: bool) -> String {
     let mut out = String::with_capacity(s.len());
@@ -145,6 +151,36 @@ pub fn base64(data: &[u8]) -> String {
         }
     }
     out
+}
+
+/// Base64 with the URL-safe alphabet and no padding (RFC 4648 §5), as PKCE and JWTs use.
+pub fn base64url(data: &[u8]) -> String {
+    base64(data)
+        .trim_end_matches('=')
+        .chars()
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            c => c,
+        })
+        .collect()
+}
+
+/// `application/x-www-form-urlencoded` body or query string from name/value pairs.
+pub fn form(pairs: &[(&str, &str)]) -> String {
+    pairs.iter().map(|(k, v)| format!("{}={}", uri_encode(k, false), uri_encode(v, false))).collect::<Vec<_>>().join("&")
+}
+
+/// The pairs of a form-encoded query string (`+` is a space); malformed escapes are dropped.
+pub fn parse_form(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| {
+            let (k, v) = p.split_once('=').unwrap_or((p, ""));
+            Some((uri_decode(&k.replace('+', " "))?, uri_decode(&v.replace('+', " "))?))
+        })
+        .collect()
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -236,6 +272,12 @@ mod tests {
         assert_eq!(uri_decode("a%2Bb%20c").as_deref(), Some("a+b c"));
         assert_eq!(uri_decode("bad%2"), None);
         assert_eq!(uri_decode("%FF"), None);
+        assert_eq!(base64url(&[0xfb, 0xff]), "-_8");
+        assert_eq!(form(&[("a b", "c&d=é")]), "a%20b=c%26d%3D%C3%A9");
+        assert_eq!(
+            parse_form("code=4%2F0A+x&state=s&&bad=%zz&flag"),
+            [("code".into(), "4/0A x".into()), ("state".into(), "s".into()), ("flag".into(), String::new())]
+        );
     }
 
     #[test]

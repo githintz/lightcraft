@@ -7,7 +7,8 @@ change before version 1. Design and rationale: [`cloud-storage.md`](cloud-storag
 ## Accounts and the app folder
 
 Each account has one **app folder** (a provider's app-folder scope, a bucket prefix, a WebDAV path, a local folder).
-Nothing outside it is read or written. Paths below are relative to it.
+Nothing outside it is read or written. Paths below are relative to it. On providers whose files are found by id, not by
+path (Google Drive), each object is a file directly in the app folder whose name is the whole path below, `/` included.
 
 ## Object names (*implemented*)
 

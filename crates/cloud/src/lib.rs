@@ -3,7 +3,7 @@
 //! server and no LightCraft account. Design: `docs/cloud-storage.md`; on-storage format:
 //! `docs/cloud-format.md` (shared with the Storage Distributor web app).
 //!
-//! This crate is the core, with no UI and no network code of its own yet:
+//! This crate is the core, with no UI:
 //! - [`Availability`] and [`SpeedClass`]: how quickly a file must come back, how fast an account is;
 //! - [`placement`]: which account(s) store a blob (a pure function of the accounts' state);
 //! - [`Provider`]: the interface every storage backend implements, blocking (callers run it on a
@@ -11,7 +11,9 @@
 //!   [`FolderProvider`] (a folder: a second disk, a NAS share, or a folder a sync client uploads);
 //! - [`ContentId`] / [`ObjectName`]: blobs are named by the SHA-256 of their content, so a
 //!   download is checked against its name ([`fetch_blob`]) and the same bytes are stored once;
-//! - [`contract`]: the checks every provider must pass.
+//! - [`contract`]: the checks every provider must pass;
+//! - native only: the network providers [`s3`], [`webdav`] and [`gdrive`] (Google Drive), and
+//!   [`oauth`] (sign-in for consumer drives, with no LightCraft server).
 //!
 //! Everything that comes back from a provider is treated as hostile input: sizes are capped
 //! before reading, names are validated, content is verified against its id.
@@ -24,10 +26,14 @@ pub mod contract;
 pub mod crypto;
 mod error;
 mod folder;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gdrive;
 pub mod manifest;
 mod memory;
 #[cfg(not(target_arch = "wasm32"))]
 mod net;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod oauth;
 pub mod placement;
 mod provider;
 #[cfg(not(target_arch = "wasm32"))]
@@ -42,6 +48,8 @@ pub use error::{CloudError, Result};
 pub use folder::FolderProvider;
 pub use manifest::{Entry, EntryKind, Manifest, Op, OpKind, Stamp};
 pub use memory::MemProvider;
+#[cfg(not(target_arch = "wasm32"))]
+pub use net::Net;
 pub use placement::{PlacementAccount, PlacementError, PlacementRequest, Weights, choose, usable_free};
 pub use provider::{Listed, Provider, ProviderInfo, Quota, RemoteRef};
 pub use vault::{AccountSecret, Vault, VaultParams};

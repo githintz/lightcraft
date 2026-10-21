@@ -7,7 +7,7 @@ use lightcraft_fetch::http::Url;
 use serde::{Deserialize, Serialize};
 
 use crate::blob::MAX_DEPTH;
-use crate::net::{MAX_META_BODY, Net, base64, uri_decode, xml_elements};
+use crate::net::{MAX_META_BODY, Net, base64, is_local, uri_decode, xml_elements};
 use crate::{CloudError, Listed, ObjectName, Provider, ProviderInfo, Quota, RemoteRef, Result};
 
 /// Most files [`Provider::list`] collects before giving up with an error.
@@ -114,10 +114,6 @@ impl WebDavProvider {
         }
         self.net.body(&mut resp, MAX_META_BODY)
     }
-}
-
-fn is_local(host: &str) -> bool {
-    host == "localhost" || host == "::1" || host.starts_with("127.")
 }
 
 /// Split a multistatus reply into its `<response>` elements' raw XML.

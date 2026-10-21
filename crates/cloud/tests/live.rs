@@ -7,10 +7,18 @@
 //! - `LIGHTCRAFT_TEST_WEBDAV=http://127.0.0.1:8081/` — a WebDAV collection the test may write
 //!   to (`_USER` / `_PASSWORD` for basic auth, empty by default).
 //!
+//! - `LIGHTCRAFT_TEST_GDRIVE_REFRESH_TOKEN` with `LIGHTCRAFT_TEST_GDRIVE_CLIENT_ID` (and
+//!   `_CLIENT_SECRET` if the client has one) — a real Google account; get a refresh token with
+//!   `cargo run -p lightcraft-cloud --example gdrive-signin -- <client id> [<client secret>]`.
+//!   Each run makes its own app folder in My Drive (`lightcraft-test-run-…`), which the test
+//!   empties but doesn't remove.
+//!
 //! Each run uses a fresh app folder, so the contract's "starts empty" holds.
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use lightcraft_cloud::gdrive::{GoogleDriveConfig, GoogleDriveProvider, MULTIPART_MAX};
+use lightcraft_cloud::oauth::OAuthClient;
 use lightcraft_cloud::s3::{S3Config, S3Provider};
 use lightcraft_cloud::webdav::{WebDavConfig, WebDavProvider};
 use lightcraft_cloud::{Provider, contract, store_blob};
@@ -78,4 +86,26 @@ fn webdav_server_passes_the_contract() {
     assert_eq!(p.list().unwrap().len(), 50);
     let q = p.quota().unwrap();
     assert!(q.used >= 200, "{q:?}");
+}
+
+#[test]
+fn google_drive_passes_the_contract() {
+    let (Some(client_id), Some(refresh)) = (env("LIGHTCRAFT_TEST_GDRIVE_CLIENT_ID"), env("LIGHTCRAFT_TEST_GDRIVE_REFRESH_TOKEN")) else {
+        eprintln!("skipped: set LIGHTCRAFT_TEST_GDRIVE_CLIENT_ID and _REFRESH_TOKEN to run against Google Drive");
+        return;
+    };
+    let client = OAuthClient::google_drive(client_id, env("LIGHTCRAFT_TEST_GDRIVE_CLIENT_SECRET"));
+    let mut config = GoogleDriveConfig::new(&client, refresh);
+    config.folder = format!("lightcraft-test-{}", run_id());
+    let mut p = GoogleDriveProvider::new(config, "live drive").unwrap();
+    contract::check_provider(&mut p).unwrap();
+    // a resumable upload in several chunks
+    let big: Vec<u8> = (0..MULTIPART_MAX as u32 + 300_000).map(|i| (i % 253) as u8).collect();
+    let mut p = p.with_chunk_size(2 * 1024 * 1024).unwrap();
+    let (id, remote) = store_blob(&mut p, &big).unwrap();
+    assert_eq!(lightcraft_cloud::fetch_blob(&mut p, &remote, &id, big.len() as u64).unwrap(), big);
+    let q = p.quota().unwrap();
+    assert!(q.used >= big.len() as u64, "{q:?}");
+    p.delete(&remote).unwrap();
+    assert!(p.list().unwrap().is_empty());
 }
