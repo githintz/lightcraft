@@ -42,6 +42,10 @@ pub struct OAuthClient {
     /// refresh token always comes back).
     #[serde(default)]
     pub extra_auth_params: Vec<(String, String)>,
+    /// A fixed loopback port, for providers that match redirect URIs exactly; `None` lets the
+    /// system pick a free one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_port: Option<u16>,
 }
 
 impl std::fmt::Debug for OAuthClient {
@@ -65,7 +69,39 @@ impl OAuthClient {
             client_id: client_id.into(),
             client_secret,
             scopes: vec![crate::gdrive::SCOPE.into()],
-            extra_auth_params: vec![("access_type".into(), "offline".into()), ("prompt".into(), "consent".into())],
+            // consent: a refresh token every time; select_account: a second account can be added
+            extra_auth_params: vec![("access_type".into(), "offline".into()), ("prompt".into(), "consent select_account".into())],
+            redirect_port: None,
+        }
+    }
+
+    /// Microsoft (OneDrive personal and work/school), for the app's own folder
+    /// ([`crate::onedrive::SCOPES`]). A public client: no secret.
+    pub fn onedrive(client_id: impl Into<String>) -> OAuthClient {
+        OAuthClient {
+            auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize".into(),
+            token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token".into(),
+            client_id: client_id.into(),
+            client_secret: None,
+            scopes: crate::onedrive::SCOPES.iter().map(|s| s.to_string()).collect(),
+            extra_auth_params: vec![("prompt".into(), "select_account".into())],
+            redirect_port: None,
+        }
+    }
+
+    /// Dropbox, for an app registered with "App folder" access ([`crate::dropbox::SCOPES`]).
+    /// Dropbox matches redirect URIs exactly, so the app's registration must list
+    /// `http://127.0.0.1:<redirect_port>`.
+    pub fn dropbox(client_id: impl Into<String>, redirect_port: u16) -> OAuthClient {
+        OAuthClient {
+            auth_url: "https://www.dropbox.com/oauth2/authorize".into(),
+            token_url: "https://api.dropboxapi.com/oauth2/token".into(),
+            client_id: client_id.into(),
+            client_secret: None,
+            scopes: crate::dropbox::SCOPES.iter().map(|s| s.to_string()).collect(),
+            // offline: a refresh token; force_reauthentication: a second account can be added
+            extra_auth_params: vec![("token_access_type".into(), "offline".into()), ("force_reauthentication".into(), "true".into())],
+            redirect_port: Some(redirect_port),
         }
     }
 }
@@ -85,6 +121,59 @@ pub struct Tokens {
 impl std::fmt::Debug for Tokens {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tokens").field("refresh_token", &self.refresh_token.is_some()).field("expires_in", &self.expires_in).finish_non_exhaustive()
+    }
+}
+
+/// An access token kept fresh from a refresh token, for the providers that sign in with OAuth.
+/// A refresh token the provider rotates is kept ([`TokenSource::refresh_token`] then returns the
+/// new one, for the vault).
+pub struct TokenSource {
+    client: OAuthClient,
+    refresh_token: String,
+    access: Option<(String, Instant)>,
+}
+
+impl std::fmt::Debug for TokenSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenSource").field("client", &self.client).finish_non_exhaustive()
+    }
+}
+
+impl TokenSource {
+    pub fn new(client: OAuthClient, refresh_token: impl Into<String>) -> TokenSource {
+        TokenSource { client, refresh_token: refresh_token.into(), access: None }
+    }
+
+    pub fn client(&self) -> &OAuthClient {
+        &self.client
+    }
+
+    pub fn refresh_token(&self) -> &str {
+        &self.refresh_token
+    }
+
+    /// A valid access token, fetched when there is none or it is about to expire.
+    pub fn bearer(&mut self, net: &Net) -> Result<String> {
+        if let Some((token, until)) = &self.access
+            && Instant::now() < *until
+        {
+            return Ok(token.clone());
+        }
+        let tokens = refresh(&self.client, net, &self.refresh_token)?;
+        if let Some(rotated) = tokens.refresh_token.filter(|t| !t.is_empty()) {
+            self.refresh_token = rotated;
+        }
+        // a minute early; a hostile lifetime can't overflow the clock
+        let life = tokens.expires_in.unwrap_or(3600).min(86_400).saturating_sub(60);
+        let until = Instant::now().checked_add(Duration::from_secs(life)).unwrap_or_else(Instant::now);
+        self.access = Some((tokens.access_token.clone(), until));
+        Ok(tokens.access_token)
+    }
+
+    /// Forget the access token (the server rejected it); the next [`TokenSource::bearer`]
+    /// fetches a new one.
+    pub fn invalidate(&mut self) {
+        self.access = None;
     }
 }
 
@@ -123,7 +212,10 @@ impl LoopbackFlow {
         let mut nonce = [0u8; 16];
         rng.fill(&mut nonce)?;
         let state = base64url(&nonce);
-        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let listener = TcpListener::bind(("127.0.0.1", client.redirect_port.unwrap_or(0))).map_err(|e| match client.redirect_port {
+            Some(port) => CloudError::Io(format!("can't listen for the sign-in on port {port} (in use by another program?): {e}")),
+            None => e.into(),
+        })?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         let redirect_uri = format!("http://127.0.0.1:{port}");
@@ -341,7 +433,7 @@ mod tests {
         assert!(url.contains("&code_challenge_method=S256&"));
         assert!(url.contains(&format!("&code_challenge={}&", pkce_challenge(&flow.verifier))));
         assert!(url.contains("scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file"));
-        assert!(url.ends_with("&access_type=offline&prompt=consent"));
+        assert!(url.ends_with("&access_type=offline&prompt=consent%20select_account"));
         assert_eq!(flow.verifier.len(), 43);
 
         let state = flow.state.clone();

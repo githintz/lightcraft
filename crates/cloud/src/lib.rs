@@ -12,7 +12,8 @@
 //! - [`ContentId`] / [`ObjectName`]: blobs are named by the SHA-256 of their content, so a
 //!   download is checked against its name ([`fetch_blob`]) and the same bytes are stored once;
 //! - [`contract`]: the checks every provider must pass;
-//! - native only: the network providers [`s3`], [`webdav`] and [`gdrive`] (Google Drive), and
+//! - native only: the network providers [`s3`], [`webdav`], [`gdrive`] (Google Drive),
+//!   [`onedrive`] and [`dropbox`], and
 //!   [`oauth`] (sign-in for consumer drives, with no LightCraft server).
 //!
 //! Everything that comes back from a provider is treated as hostile input: sizes are capped
@@ -24,6 +25,8 @@ mod availability;
 mod blob;
 pub mod contract;
 pub mod crypto;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dropbox;
 mod error;
 mod folder;
 #[cfg(not(target_arch = "wasm32"))]
@@ -34,6 +37,8 @@ mod memory;
 mod net;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod oauth;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod onedrive;
 pub mod placement;
 mod provider;
 #[cfg(not(target_arch = "wasm32"))]

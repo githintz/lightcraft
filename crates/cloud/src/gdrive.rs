@@ -15,15 +15,14 @@
 //! agrees on which one counts (for blobs both hold the same bytes anyway).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use lightcraft_fetch::http::{Response, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::net::{MAX_META_BODY, Net, form, hex, is_local};
-use crate::oauth::{self, OAuthClient};
+use crate::net::{MAX_META_BODY, Net, form, hex, is_local, retry_after};
+use crate::oauth::{OAuthClient, TokenSource};
 use crate::{CloudError, Listed, ObjectName, Provider, ProviderInfo, Quota, RemoteRef, Result};
 
 /// Access to the files LightCraft creates, and nothing else in the user's Drive.
@@ -96,8 +95,7 @@ impl std::fmt::Debug for GoogleDriveConfig {
 }
 
 pub struct GoogleDriveProvider {
-    client: OAuthClient,
-    refresh_token: String,
+    tokens: TokenSource,
     folder_name: String,
     api: Url,
     label: String,
@@ -105,7 +103,6 @@ pub struct GoogleDriveProvider {
     /// First wait before a retry; doubles each time.
     pub retry_base: Duration,
     chunk: usize,
-    access: Option<(String, Instant)>,
     folder_id: Option<String>,
 }
 
@@ -231,15 +228,13 @@ impl GoogleDriveProvider {
         let mut client = OAuthClient::google_drive(config.client_id, config.client_secret);
         client.token_url = config.token_url;
         Ok(GoogleDriveProvider {
-            client,
-            refresh_token: config.refresh_token,
+            tokens: TokenSource::new(client, config.refresh_token),
             folder_name: folder.to_string(),
             api,
             label: label.into(),
             net: Net::default(),
             retry_base: Duration::from_secs(1),
             chunk: DEFAULT_CHUNK,
-            access: None,
             folder_id: None,
         })
     }
@@ -256,7 +251,7 @@ impl GoogleDriveProvider {
     /// The refresh token in use: providers that rotate it hand out a new one on refresh, which
     /// the vault must then store.
     pub fn refresh_token(&self) -> &str {
-        &self.refresh_token
+        self.tokens.refresh_token()
     }
 
     /// The app folder's id, finding or creating the folder on first use.
@@ -283,28 +278,8 @@ impl GoogleDriveProvider {
         Url { path: format!("{}{path_and_query}", self.api.path.trim_end_matches('/')), ..self.api.clone() }
     }
 
-    fn token(&mut self) -> Result<String> {
-        if let Some((token, until)) = &self.access
-            && Instant::now() < *until
-        {
-            return Ok(token.clone());
-        }
-        let tokens = oauth::refresh(&self.client, &self.net, &self.refresh_token)?;
-        if let Some(rotated) = tokens.refresh_token.filter(|t| !t.is_empty()) {
-            self.refresh_token = rotated;
-        }
-        let life = tokens.expires_in.unwrap_or(3600).min(86_400).saturating_sub(60);
-        let until = Instant::now().checked_add(Duration::from_secs(life)).unwrap_or_else(Instant::now);
-        self.access = Some((tokens.access_token.clone(), until));
-        Ok(tokens.access_token)
-    }
-
-    fn backoff(&self, attempt: u32) -> Result<()> {
-        if self.net.cancel.load(Ordering::Relaxed) {
-            return Err(CloudError::Io("cancelled".into()));
-        }
-        std::thread::sleep(self.retry_base.saturating_mul(1u32 << attempt.min(6)));
-        Ok(())
+    fn backoff(&self, attempt: u32, resp: Option<&Response>) -> Result<()> {
+        self.net.backoff(self.retry_base, attempt, resp.and_then(retry_after))
     }
 
     /// An authorized API request. A rejected access token is refreshed once; rate limits and
@@ -314,17 +289,17 @@ impl GoogleDriveProvider {
         let mut refreshed = false;
         let mut attempt = 0u32;
         loop {
-            let token = self.token()?;
+            let token = self.tokens.bearer(&self.net)?;
             let mut h = headers.to_vec();
             h.push(("Authorization", format!("Bearer {token}")));
             let mut resp = self.net.send(method, url, &h, body)?;
             match resp.status {
                 401 if !refreshed => {
-                    self.access = None;
+                    self.tokens.invalidate();
                     refreshed = true;
                 }
                 429 | 500 | 502 | 503 | 504 if attempt < MAX_RETRIES => {
-                    self.backoff(attempt)?;
+                    self.backoff(attempt, Some(&resp))?;
                     attempt += 1;
                 }
                 403 => {
@@ -332,7 +307,7 @@ impl GoogleDriveProvider {
                     if !(is_rate_limit(&reply) && attempt < MAX_RETRIES) {
                         return Err(drive_error(what, 403, &reply));
                     }
-                    self.backoff(attempt)?;
+                    self.backoff(attempt, None)?;
                     attempt += 1;
                 }
                 _ => return Ok(resp),
@@ -435,7 +410,7 @@ impl GoogleDriveProvider {
                     if failures > MAX_RETRIES {
                         return Err(e);
                     }
-                    self.backoff(failures - 1)?;
+                    self.backoff(failures - 1, None)?;
                     ask = true;
                     continue;
                 }
@@ -460,7 +435,7 @@ impl GoogleDriveProvider {
                         if failures > MAX_RETRIES {
                             return Err(CloudError::Io("the upload stopped making progress".into()));
                         }
-                        self.backoff(failures - 1)?;
+                        self.backoff(failures - 1, None)?;
                     }
                     offset = next;
                 }
@@ -470,7 +445,7 @@ impl GoogleDriveProvider {
                     if failures > MAX_RETRIES {
                         return Err(self.error("upload", &mut resp));
                     }
-                    self.backoff(failures - 1)?;
+                    self.backoff(failures - 1, Some(&resp))?;
                     ask = true;
                 }
                 _ => return Err(self.error("upload", &mut resp)),

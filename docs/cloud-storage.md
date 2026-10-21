@@ -1,6 +1,6 @@
 # Distributed cloud storage (proposal)
 
-**Status:** proposal; phase 1 (core crate `crates/cloud`) done; phase 2 (network providers): S3-compatible, WebDAV and Google Drive done, OneDrive and Dropbox next. Opt-in; nothing changes for a library
+**Status:** proposal; phase 1 (core crate `crates/cloud`) done; phase 2 (network providers) done: S3-compatible, WebDAV, Google Drive, OneDrive and Dropbox. Opt-in; nothing changes for a library
 that doesn't turn it on. The local library stays the source of truth.
 
 LightCraft is local-first: no LightCraft account, no LightCraft server, no telemetry. This proposal keeps all three.
@@ -82,7 +82,7 @@ What each kind of file asks for by default:
 |---|---|---|
 | **0. Format spec** | [`cloud-format.md`](cloud-format.md): blob naming, encryption, manifest; shared with Storage Distributor | Both projects reference one spec |
 | **1. Core crate** (done) | `crates/cloud`: availability, placement (+ ported tests), `Provider` trait, content-addressed blobs, folder + memory providers, contract checks, segmented AES-256-GCM blob encryption, the Argon2id passphrase vault, the manifest (per-field last-writer-wins merge, snapshots, op logs) | Contract checks pass for every provider; no UI |
-| **2. First network providers** (S3, WebDAV and Google Drive done) | S3-compatible (`crates/cloud/src/s3.rs`: B2, R2, Wasabi, MinIO…; SigV4 written from the spec, checked against AWS's published examples and botocore), WebDAV (`crates/cloud/src/webdav.rs`: Nextcloud, ownCloud, NAS; basic auth only over https or to this computer), Google Drive (`crates/cloud/src/gdrive.rs`, see below). Sign-in for consumer drives: `crates/cloud/src/oauth.rs`, the authorization code flow with PKCE (RFC 7636) and a loopback redirect (RFC 8252), no LightCraft server. Next: OneDrive, Dropbox on the same sign-in; S3 multipart upload above 5 GiB | Contract checks pass against local test servers (moto for S3, WsgiDAV with and without auth, a fake Drive in `tests/gdrive.rs`) |
+| **2. Network providers** (done) | S3-compatible (`crates/cloud/src/s3.rs`: B2, R2, Wasabi, MinIO…; SigV4 written from the spec, checked against AWS's published examples and botocore), WebDAV (`crates/cloud/src/webdav.rs`: Nextcloud, ownCloud, NAS; basic auth only over https or to this computer), Google Drive (`crates/cloud/src/gdrive.rs`), OneDrive (`crates/cloud/src/onedrive.rs`), Dropbox (`crates/cloud/src/dropbox.rs`), see below. Sign-in for consumer drives: `crates/cloud/src/oauth.rs`, the authorization code flow with PKCE (RFC 7636) and a loopback redirect (RFC 8252), no LightCraft server. Later: S3 multipart upload above 5 GiB | Contract checks pass against local test servers (moto for S3, WsgiDAV with and without auth; fakes of Drive, Graph and Dropbox in `tests/`) |
 | **3. Backup (one-way)** | Push originals, catalog snapshots and smart previews; restore a whole library on another machine. `cloud.connect`, `cloud.accounts`, `cloud.backup`, `cloud.restore`; Settings ▸ Cloud; Info ▸ "Stored on" | A library restored from the accounts alone matches the original |
 | **4. Offload originals** | Availability per album / photo; "Free up local space"; an offloaded original is fetched on demand while its smart preview is shown; ties into Missing Photos | Edit and export a photo whose original is only in the cloud |
 | **5. Several devices** | First one writer at a time (a remote lease next to `catalog.lock`: "checked out on MacBook"); later per-op device id + Lamport clock and per-op merge rules | Two machines take turns on one library; later edit at once |
@@ -105,8 +105,41 @@ What each kind of file asks for by default:
 - **Quota:** `about.storageQuota`, the whole account (Drive, Gmail and Photos share it); no limit for accounts without
   one. Refreshing it (for placement) is the engine's job in phase 3; a few minutes' staleness is fine.
 - **Client id:** each build needs a Google Cloud OAuth client of type *Desktop app* (public, per RFC 8252). Users can
-  bring their own. `cargo run -p lightcraft-cloud --example gdrive-signin -- <client id> [<secret>]` signs in and prints
-  a refresh token.
+  bring their own.
+
+### OneDrive
+
+- **Scope `Files.ReadWrite.AppFolder`:** only the app's folder (`Apps/<app name>`, Graph's `special/approot`), personal
+  and work/school accounts (the `common` endpoint). A public client: no secret. Microsoft rotates refresh tokens; the
+  provider keeps the newest (`refresh_token()`) for the vault.
+- **Layout:** files addressed by path (`blobs/ab/<id>.bin`), folders made as needed; the `RemoteRef` is the path.
+- **Uploads:** one request up to 4 MiB; above that an upload session in chunks (multiples of 320 KiB, 10 MiB by
+  default). After a failure it asks the session for `nextExpectedRanges` and goes on. The session address and download
+  redirects are pre-authenticated addresses and are sent no credentials; they must be https. A listing's next page must
+  come from Graph itself.
+- **Errors:** 429 and 5xx retried with `Retry-After`; `quotaLimitReached` / 507 is "the storage account is full".
+- **Registration:** a "Mobile and desktop applications" platform with the loopback redirect URI `http://127.0.0.1`
+  (sign-in sends `http://127.0.0.1:<port>`; Microsoft ignores the port of loopback redirect URIs). If the portal won't
+  take it, add it in the app manifest; Microsoft's "redirect URI restrictions" page is the reference. Not yet tried
+  against a real registration.
+
+### Dropbox
+
+- **App folder access:** the app is registered with "App folder" access, so it sees only `Apps/<app name>`. Scopes:
+  `files.content.write`, `files.content.read`, `files.metadata.read`, `account_info.read`. A public client with PKCE.
+- **Redirect:** Dropbox matches redirect URIs exactly, so sign-in listens on a fixed loopback port (53682 by default,
+  `OAuthClient::redirect_port`), which the app registration lists as `http://127.0.0.1:53682`.
+- **Layout:** files addressed by path under an optional subfolder of the app folder (`root`); the `RemoteRef` is the
+  object name.
+- **Uploads:** one request up to 8 MiB; above that an upload session appended in 8 MiB chunks. A chunk whose answer was
+  lost is sent again, and Dropbox's `incorrect_offset` says how much it really holds.
+- **Errors:** 429 and 5xx retried with `Retry-After`; `insufficient_space` is "the storage account is full";
+  `not_found` on delete is not an error.
+
+### Signing in by hand
+
+`cargo run -p lightcraft-cloud --example cloud-signin -- gdrive|onedrive|dropbox <client id> [<secret>]` opens the
+sign-in and prints a refresh token (for the live tests below).
 
 The 9Drive web app (Zenhosta, Apache-2.0; a server-hosted Express + MySQL gateway over several Google Drive and S3
 accounts) served as a reference for which Drive calls a multi-account gateway needs. No code was taken from it: this is
@@ -115,7 +148,8 @@ written from Google's public REST documentation.
 ## Testing
 
 `cargo test -p lightcraft-cloud` runs everything offline: the provider contract against the memory and folder
-providers and a fake Google Drive (with dropped chunks, rate limits, expired tokens and the sign-in redirect), SigV4 against fixed vectors, the HTTP client against a local echo server. `tests/live.rs` runs the same
+providers and fakes of Google Drive, Microsoft Graph and Dropbox (with dropped chunks, lost answers, rate limits,
+expired and rotated tokens, hostile addresses and the sign-in redirect), SigV4 against fixed vectors, the HTTP client against a local echo server. `tests/live.rs` runs the same
 contract against real servers, only when one is configured:
 
 ```sh
@@ -126,7 +160,8 @@ LIGHTCRAFT_TEST_WEBDAV=http://127.0.0.1:8081/ \
 
 `LIGHTCRAFT_TEST_S3_KEY` / `_SECRET` / `_REGION` and `LIGHTCRAFT_TEST_WEBDAV_USER` / `_PASSWORD` set credentials.
 `LIGHTCRAFT_TEST_GDRIVE_CLIENT_ID` / `_CLIENT_SECRET` / `_REFRESH_TOKEN` run it against a real Google account (in a new
-folder in My Drive per run). Any
+folder in My Drive per run); `LIGHTCRAFT_TEST_ONEDRIVE_CLIENT_ID` / `_REFRESH_TOKEN` against OneDrive (the app folder
+must be empty); `LIGHTCRAFT_TEST_DROPBOX_CLIENT_ID` / `_REFRESH_TOKEN` against Dropbox (a new subfolder per run). Any
 S3-compatible server works (MinIO, Garage, moto: `moto_server -p 5055`); any WebDAV server (WsgiDAV:
 `wsgidav --port 8081 --root <dir> --auth anonymous`). Each run writes to a fresh app folder.
 

@@ -9,16 +9,23 @@
 //!
 //! - `LIGHTCRAFT_TEST_GDRIVE_REFRESH_TOKEN` with `LIGHTCRAFT_TEST_GDRIVE_CLIENT_ID` (and
 //!   `_CLIENT_SECRET` if the client has one) — a real Google account; get a refresh token with
-//!   `cargo run -p lightcraft-cloud --example gdrive-signin -- <client id> [<client secret>]`.
+//!   `cargo run -p lightcraft-cloud --example cloud-signin -- gdrive <client id> [<client secret>]`.
 //!   Each run makes its own app folder in My Drive (`lightcraft-test-run-…`), which the test
 //!   empties but doesn't remove.
+//!
+//! - `LIGHTCRAFT_TEST_ONEDRIVE_CLIENT_ID` / `_REFRESH_TOKEN` — a real Microsoft account
+//!   (`cloud-signin -- onedrive <client id>`); the run uses a subfolder of the app folder.
+//! - `LIGHTCRAFT_TEST_DROPBOX_CLIENT_ID` / `_REFRESH_TOKEN` — a real Dropbox account with an
+//!   app-folder app (`cloud-signin -- dropbox <app key>`); the run uses a subfolder.
 //!
 //! Each run uses a fresh app folder, so the contract's "starts empty" holds.
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use lightcraft_cloud::dropbox::{DropboxConfig, DropboxProvider};
 use lightcraft_cloud::gdrive::{GoogleDriveConfig, GoogleDriveProvider, MULTIPART_MAX};
 use lightcraft_cloud::oauth::OAuthClient;
+use lightcraft_cloud::onedrive::{OneDriveConfig, OneDriveProvider};
 use lightcraft_cloud::s3::{S3Config, S3Provider};
 use lightcraft_cloud::webdav::{WebDavConfig, WebDavProvider};
 use lightcraft_cloud::{Provider, contract, store_blob};
@@ -108,4 +115,38 @@ fn google_drive_passes_the_contract() {
     assert!(q.used >= big.len() as u64, "{q:?}");
     p.delete(&remote).unwrap();
     assert!(p.list().unwrap().is_empty());
+}
+
+/// The contract, then a large upload in several chunks, against one live account.
+fn live_round_trip(p: &mut dyn Provider, big: usize) {
+    contract::check_provider(p).unwrap();
+    let data: Vec<u8> = (0..big as u32).map(|i| (i % 251) as u8).collect();
+    let (id, remote) = store_blob(p, &data).unwrap();
+    assert_eq!(lightcraft_cloud::fetch_blob(p, &remote, &id, data.len() as u64).unwrap(), data);
+    p.delete(&remote).unwrap();
+    assert!(p.list().unwrap().is_empty());
+}
+
+#[test]
+fn onedrive_passes_the_contract() {
+    let (Some(client_id), Some(refresh)) = (env("LIGHTCRAFT_TEST_ONEDRIVE_CLIENT_ID"), env("LIGHTCRAFT_TEST_ONEDRIVE_REFRESH_TOKEN")) else {
+        eprintln!("skipped: set LIGHTCRAFT_TEST_ONEDRIVE_CLIENT_ID and _REFRESH_TOKEN to run against OneDrive");
+        return;
+    };
+    let config = OneDriveConfig::new(&OAuthClient::onedrive(client_id), refresh);
+    // the app folder is shared by every run: it must start empty for the contract
+    let mut p = OneDriveProvider::new(config, "live onedrive").unwrap().with_chunk_size(10 * 320 * 1024).unwrap();
+    live_round_trip(&mut p, lightcraft_cloud::onedrive::SIMPLE_MAX + 4_000_000);
+}
+
+#[test]
+fn dropbox_passes_the_contract() {
+    let (Some(client_id), Some(refresh)) = (env("LIGHTCRAFT_TEST_DROPBOX_CLIENT_ID"), env("LIGHTCRAFT_TEST_DROPBOX_REFRESH_TOKEN")) else {
+        eprintln!("skipped: set LIGHTCRAFT_TEST_DROPBOX_CLIENT_ID and _REFRESH_TOKEN to run against Dropbox");
+        return;
+    };
+    let mut config = DropboxConfig::new(&OAuthClient::dropbox(client_id, lightcraft_cloud::dropbox::DEFAULT_REDIRECT_PORT), refresh);
+    config.root = format!("/{}", run_id());
+    let mut p = DropboxProvider::new(config, "live dropbox").unwrap().with_chunk_size(4 * 1024 * 1024).unwrap();
+    live_round_trip(&mut p, lightcraft_cloud::dropbox::SIMPLE_MAX + 5_000_000);
 }

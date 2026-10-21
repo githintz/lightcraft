@@ -6,6 +6,9 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+
+mod common;
+use common::{Request, json_reply, params, read_request, reply};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -95,82 +98,6 @@ fn start() -> (Shared, String) {
         }
     });
     (state, format!("http://127.0.0.1:{port}"))
-}
-
-fn decode(s: &str) -> String {
-    let b = s.replace('+', " ");
-    let b = b.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            out.push(u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap(), 16).unwrap());
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).unwrap()
-}
-
-fn params(query: &str) -> HashMap<String, String> {
-    query.split('&').filter(|p| !p.is_empty()).map(|p| p.split_once('=').unwrap_or((p, ""))).map(|(k, v)| (decode(k), decode(v))).collect()
-}
-
-struct Request {
-    method: String,
-    path: String,
-    query: HashMap<String, String>,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
-}
-
-fn read_request(conn: &mut TcpStream) -> Option<Request> {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 4096];
-    let head_end = loop {
-        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break i + 4;
-        }
-        let n = conn.read(&mut byte).ok()?;
-        if n == 0 {
-            return None;
-        }
-        buf.extend_from_slice(&byte[..n]);
-    };
-    let head = String::from_utf8(buf[..head_end].to_vec()).ok()?;
-    let mut lines = head.lines();
-    let mut first = lines.next()?.split_whitespace();
-    let method = first.next()?.to_string();
-    let target = first.next()?.to_string();
-    let headers: HashMap<String, String> =
-        lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
-    let len: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let mut body = buf[head_end..].to_vec();
-    while body.len() < len {
-        let n = conn.read(&mut byte).ok()?;
-        if n == 0 {
-            return None;
-        }
-        body.extend_from_slice(&byte[..n]);
-    }
-    let (path, query) = target.split_once('?').unwrap_or((&target, ""));
-    Some(Request { method, path: path.to_string(), query: params(query), headers, body })
-}
-
-fn reply(conn: &mut TcpStream, status: u16, headers: &[(&str, String)], body: &[u8]) {
-    let mut head = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());
-    for (k, v) in headers {
-        head.push_str(&format!("{k}: {v}\r\n"));
-    }
-    head.push_str("\r\n");
-    let _ = conn.write_all(head.as_bytes());
-    let _ = conn.write_all(body);
-}
-
-fn json_reply(conn: &mut TcpStream, status: u16, v: Value) {
-    reply(conn, status, &[("Content-Type", "application/json".into())], v.to_string().as_bytes());
 }
 
 fn error(conn: &mut TcpStream, status: u16, reason: &str, message: &str) {

@@ -12,11 +12,12 @@ format: `docs/cloud-format.md`.
 - `crypto`: segmented AES-256-GCM blob encryption (file keys wrapped by the library's data key); `vault`: the data key
   and account credentials under an Argon2id passphrase key; `manifest`: entries and replicas as an op log whose ops
   merge in any order (per-field last writer wins), with snapshots.
-- `s3` (S3-compatible, SigV4 by hand), `webdav` (RFC 4918, basic auth) and `gdrive` (Google Drive v3, `drive.file`
-  scope, resumable uploads): network providers on `lightcraft-fetch`'s pure-Rust HTTPS client, native only. `oauth`:
-  sign-in with PKCE and a loopback redirect (RFC 7636, RFC 8252), no server; `examples/gdrive-signin.rs` prints a
-  refresh token. Live tests: `docs/cloud-storage.md` → Testing.
-- `contract::check_provider`: the checks every provider passes (`tests/providers.rs`; Google Drive against a fake
-  server in `tests/gdrive.rs`).
+- `s3` (S3-compatible, SigV4 by hand), `webdav` (RFC 4918, basic auth), `gdrive` (Google Drive v3, `drive.file`
+  scope), `onedrive` (Microsoft Graph, app folder) and `dropbox` (API v2, app folder), with resumable uploads: network
+  providers on `lightcraft-fetch`'s pure-Rust HTTPS client, native only. `oauth`: sign-in with PKCE and a loopback
+  redirect (RFC 7636, RFC 8252), no server, and `TokenSource` (access tokens from a refresh token);
+  `examples/cloud-signin.rs` prints a refresh token. Live tests: `docs/cloud-storage.md` → Testing.
+- `contract::check_provider`: the checks every provider passes (`tests/providers.rs`; Google Drive, OneDrive and
+  Dropbox against fake servers in `tests/gdrive.rs`, `tests/onedrive.rs`, `tests/dropbox.rs`).
 
 No UI yet. Builds for wasm32; randomness comes from the caller (`crypto::Random`; `OsRandom` on native).

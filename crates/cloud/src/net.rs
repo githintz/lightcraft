@@ -80,6 +80,35 @@ impl Net {
     }
 }
 
+/// Longest wait a server's `Retry-After` may ask for.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
+
+/// The wait a `Retry-After: <seconds>` header asks for, capped at [`MAX_RETRY_AFTER`].
+pub fn retry_after(resp: &Response) -> Option<Duration> {
+    let secs: u64 = resp.header("Retry-After")?.trim().parse().ok()?;
+    Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER))
+}
+
+impl Net {
+    /// Wait before retry number `attempt` (from 0): `base` doubled each time, or what the server
+    /// asked for, whichever is longer. A raised cancel flag ends the wait with an error.
+    pub fn backoff(&self, base: Duration, attempt: u32, server: Option<Duration>) -> Result<()> {
+        let wait = base.saturating_mul(1u32 << attempt.min(6)).max(server.unwrap_or_default()).min(MAX_RETRY_AFTER);
+        let now = std::time::Instant::now();
+        let deadline = now.checked_add(wait).unwrap_or(now);
+        loop {
+            if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(CloudError::Io("cancelled".into()));
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Ok(());
+            }
+            std::thread::sleep(left.min(Duration::from_millis(200)));
+        }
+    }
+}
+
 /// The `<Code>`/`<Message>` of an S3-style XML error, else the start of the body as text.
 fn server_message(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
