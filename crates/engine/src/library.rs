@@ -299,6 +299,11 @@ impl Session {
         }
         // Photo ids belong to one library; denoise work must not carry into the next.
         self.denoise.library_changed();
+        // the old library's cloud vault (unlocked, with its passphrase) stays with it
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.cloud = Default::default();
+        }
         self.media.denoise.clear();
         // what was learned about the old library's faces is saved, and none of it carries over (photo ids are per library)
         #[cfg(not(target_arch = "wasm32"))]

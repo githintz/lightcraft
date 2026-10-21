@@ -455,6 +455,10 @@ impl GoogleDriveProvider {
 }
 
 impl Provider for GoogleDriveProvider {
+    fn refresh_token(&self) -> Option<&str> {
+        Some(self.tokens.refresh_token())
+    }
+
     fn info(&self) -> ProviderInfo {
         ProviderInfo { provider: "gdrive".into(), label: self.label.clone(), max_file_size: Some(MAX_FILE_SIZE) }
     }

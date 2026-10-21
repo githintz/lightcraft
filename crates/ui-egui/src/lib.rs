@@ -39,6 +39,8 @@ pub mod widgets;
 #[cfg(test)]
 mod tests_album_picker;
 #[cfg(test)]
+mod tests_cloud_settings;
+#[cfg(test)]
 mod tests_crop_rotate;
 #[cfg(test)]
 mod tests_curve;

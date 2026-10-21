@@ -12,6 +12,8 @@
 //! - [`ContentId`] / [`ObjectName`]: blobs are named by the SHA-256 of their content, so a
 //!   download is checked against its name ([`fetch_blob`]) and the same bytes are stored once;
 //! - [`contract`]: the checks every provider must pass;
+//! - [`backup`]: backup and restore over a [`backup::Fleet`] of accounts (placement, encrypted
+//!   blobs, the manifest on every account); [`accounts`] opens a vault's accounts (native);
 //! - native only: the network providers [`s3`], [`webdav`], [`gdrive`] (Google Drive),
 //!   [`onedrive`] and [`dropbox`], and
 //!   [`oauth`] (sign-in for consumer drives, with no LightCraft server).
@@ -21,7 +23,10 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod accounts;
 mod availability;
+pub mod backup;
 mod blob;
 pub mod contract;
 pub mod crypto;

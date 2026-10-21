@@ -23,6 +23,7 @@ can't point outside the app folder.
 | `manifest/snapshot-<v>.json` | manifest snapshot after op `<v>` (encrypted: `.json.enc`) |
 | `manifest/ops-<v>-<n>.json` | manifest ops `n…` after snapshot `<v>` (encrypted: `.json.enc`) |
 | `vault.enc` | the vault: the data key, and the accounts' settings and credentials (see Vault) |
+| `account.json` | `{"format": "lightcraft-cloud-account", "id": "<this account's id in the vault>"}`, not encrypted |
 
 ## Content ids (*implemented*)
 
@@ -84,7 +85,15 @@ JSON: {"format": "lightcraft-vault", "data_key": "<64 hex>", "accounts": [{"id",
 - A vault larger than 1 MiB is refused.
 - Changing the passphrase rewrites only the vault. Blobs stay wrapped under the same data key.
 
-## Manifest (*implemented* in memory, `crates/cloud/src/manifest.rs`; replication is phase 3)
+## Library entries (*implemented*, LightCraft's backup)
+
+Manifest entry ids LightCraft uses: `catalog.<file>` (a library file: `catalog.snap`, `catalog.log`, `presets.json`,
+`prefs.json`, `view.json`), `library.info` (`{"format": "lightcraft-library-info", "dir", "device"}`), `cloud.settings`,
+`original.<photo id>` (name: the original's path), `smart.<file>` (a smart preview). Each blob is encrypted (above)
+and named by its plaintext's content id. Snapshots are written as `manifest/snapshot-<clock>.json.enc`; the newest
+two are kept on each account.
+
+## Manifest (*implemented*, `crates/cloud/src/manifest.rs`; stored as snapshots by `crates/cloud/src/backup.rs`)
 
 The manifest is an op log plus periodic snapshots, the same model as LightCraft's catalog journal.
 

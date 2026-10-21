@@ -17,6 +17,8 @@ extern crate lightcraft_denoise_core as lightcraft_denoise;
 pub mod availability;
 mod camera_preview;
 pub mod camera_profiles;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cloud;
 pub mod cmd;
 pub mod config;
 pub mod contact_sheet;
@@ -263,6 +265,9 @@ pub struct Session {
     pub folder_changes: Option<sync::FolderChanges>,
     /// The last (or running) Build Previews.
     pub preview_build: Option<std::sync::Arc<cmd::previews::PreviewBuild>>,
+    /// Cloud backup: the unlocked vault, settings and the running job (`cmd/cloud.rs`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub cloud: cloud::CloudState,
     /// Develop defaults applied on import (persisted in prefs.json).
     pub import_defaults: import::ImportDefaults,
     /// Disk budget of the library's thumbnail cache in MB (0 = default; persisted in prefs.json).
@@ -346,6 +351,8 @@ impl Session {
             import_probes: Default::default(),
             folder_changes: None,
             preview_build: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            cloud: Default::default(),
             import_defaults: import::ImportDefaults::default(),
             cache_mb: 0,
             smart_previews_dir: None,
@@ -861,6 +868,8 @@ pub fn json_delta(old: &Value, new: &Value) -> Option<Value> {
 mod tests;
 #[cfg(test)]
 mod tests_album_order;
+#[cfg(test)]
+mod tests_cloud;
 #[cfg(test)]
 mod tests_color;
 #[cfg(test)]

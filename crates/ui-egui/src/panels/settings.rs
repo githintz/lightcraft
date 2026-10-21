@@ -1,4 +1,5 @@
-//! The Settings dialog (⌘,): General, Import, Performance, Display, Interface, Faces, AI Denoise.
+//! The Settings dialog (⌘,): General, Import, Performance, Display, Interface, Faces, AI Denoise,
+//! Cloud.
 //!
 //! Changes apply immediately (no OK/Cancel). Where they are stored:
 //! - **app settings** ([`crate::state::AppSettings`]: startup view, delete confirmation, GPU,
@@ -26,6 +27,7 @@ pub const TABS: &[(&str, &str)] = &[
     ("interface", "Interface"),
     ("faces", "Faces"),
     ("denoise", "AI Denoise"),
+    ("cloud", "Cloud"),
 ];
 
 /// Thumbnail cache sizes offered (MB).
@@ -55,6 +57,7 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, tab: &mut String) {
         "interface" => interface_tab(app, ui, &t),
         "faces" => super::faces::settings_tab(app, ui, &t),
         "denoise" => super::denoise::settings_tab(app, ui, &t),
+        "cloud" => super::cloud::settings_tab(app, ui, &t),
         _ => general_tab(app, ui, &t),
     }
 }

@@ -63,4 +63,10 @@ pub trait Provider: Send {
     /// Every object in the app folder (index rebuild, audits). Entries whose names aren't valid
     /// [`ObjectName`]s are skipped, never returned.
     fn list(&mut self) -> Result<Vec<Listed>>;
+
+    /// The OAuth refresh token in use, for providers that sign in with one: some providers
+    /// rotate it, and the vault must then store the new one.
+    fn refresh_token(&self) -> Option<&str> {
+        None
+    }
 }

@@ -1,6 +1,7 @@
 # Distributed cloud storage (proposal)
 
-**Status:** proposal; phase 1 (core crate `crates/cloud`) done; phase 2 (network providers) done: S3-compatible, WebDAV, Google Drive, OneDrive and Dropbox. Opt-in; nothing changes for a library
+**Status:** proposal; phase 1 (core crate `crates/cloud`) done; phase 2 (network providers) done: S3-compatible, WebDAV, Google Drive, OneDrive and Dropbox; phase 3 (backup and
+restore) done: `cloud.*` commands (CLI, control channel, MCP) and Settings ▸ Cloud. Opt-in; nothing changes for a library
 that doesn't turn it on. The local library stays the source of truth.
 
 LightCraft is local-first: no LightCraft account, no LightCraft server, no telemetry. This proposal keeps all three.
@@ -83,7 +84,7 @@ What each kind of file asks for by default:
 | **0. Format spec** | [`cloud-format.md`](cloud-format.md): blob naming, encryption, manifest; shared with Storage Distributor | Both projects reference one spec |
 | **1. Core crate** (done) | `crates/cloud`: availability, placement (+ ported tests), `Provider` trait, content-addressed blobs, folder + memory providers, contract checks, segmented AES-256-GCM blob encryption, the Argon2id passphrase vault, the manifest (per-field last-writer-wins merge, snapshots, op logs) | Contract checks pass for every provider; no UI |
 | **2. Network providers** (done) | S3-compatible (`crates/cloud/src/s3.rs`: B2, R2, Wasabi, MinIO…; SigV4 written from the spec, checked against AWS's published examples and botocore), WebDAV (`crates/cloud/src/webdav.rs`: Nextcloud, ownCloud, NAS; basic auth only over https or to this computer), Google Drive (`crates/cloud/src/gdrive.rs`), OneDrive (`crates/cloud/src/onedrive.rs`), Dropbox (`crates/cloud/src/dropbox.rs`), see below. Sign-in for consumer drives: `crates/cloud/src/oauth.rs`, the authorization code flow with PKCE (RFC 7636) and a loopback redirect (RFC 8252), no LightCraft server. Later: S3 multipart upload above 5 GiB | Contract checks pass against local test servers (moto for S3, WsgiDAV with and without auth; fakes of Drive, Graph and Dropbox in `tests/`) |
-| **3. Backup (one-way)** | Push originals, catalog snapshots and smart previews; restore a whole library on another machine. `cloud.connect`, `cloud.accounts`, `cloud.backup`, `cloud.restore`; Settings ▸ Cloud; Info ▸ "Stored on" | A library restored from the accounts alone matches the original |
+| **3. Backup (one-way)** (engine done) | Push originals, catalog snapshots and smart previews; restore a whole library on another machine. `crates/cloud/src/backup.rs` (the fleet: placement, encrypted blobs, the manifest on every account, restore, prune), `crates/cloud/src/accounts.rs` (a vault's accounts opened by kind), `crates/engine/src/cloud.rs` + `crates/engine/src/cmd/cloud.rs` (`cloud.*` commands, worker-thread jobs), `crates/ui-egui/src/panels/cloud.rs` (Settings ▸ Cloud). Next: Info ▸ "Stored on"; S3, WebDAV and restore in the UI | A library restored from the accounts alone matches the original (`crates/engine/src/tests_cloud.rs`) |
 | **4. Offload originals** | Availability per album / photo; "Free up local space"; an offloaded original is fetched on demand while its smart preview is shown; ties into Missing Photos | Edit and export a photo whose original is only in the cloud |
 | **5. Several devices** | First one writer at a time (a remote lease next to `catalog.lock`: "checked out on MacBook"); later per-op device id + Lamport clock and per-op merge rules | Two machines take turns on one library; later edit at once |
 | **6. Web and tablet** | The web build opens the synced library (browser `fetch` transport; only CORS-friendly providers) | A tablet browses and edits a desktop library |
@@ -145,9 +146,52 @@ The 9Drive web app (Zenhosta, Apache-2.0; a server-hosted Express + MySQL gatewa
 accounts) served as a reference for which Drive calls a multi-account gateway needs. No code was taken from it: this is
 written from Google's public REST documentation.
 
+## Using it (phase 3)
+
+Everything is a command, so the CLI, the control channel and MCP drive it; **Settings ▸ Cloud** calls the same ones:
+set up or unlock with the passphrase, add a folder (the folder picker) or sign in to Google Drive / OneDrive / Dropbox
+in the browser (with the client id of an app registration), a size limit per account, copies of originals, smart
+previews on or off, Back Up Now with progress and Stop, Check Accounts, Lock. S3 and WebDAV accounts and restoring a
+library are commands only for now. None of them is journaled (they carry passphrases and credentials).
+
+```text
+cloud.setup        {passphrase}                         a new vault (data key, no accounts) in <library>/cloud/
+cloud.unlock       {passphrase}   cloud.lock {}          cloud.changePassphrase {old, new}
+cloud.addAccount   {provider: folder|s3|webdav, config, label, cap?, speed?, priority?}
+cloud.signIn       {provider: gdrive|onedrive|dropbox, clientId}  → {url}; cloud.signInStatus adds the account
+cloud.setAccount   {id, label?, cap?, speed?, priority?, acceptsUploads?}    cloud.removeAccount {id}
+cloud.configure    {originalCopies?: 1–8, smartPreviews?, clientIds?}
+cloud.backup       {wait?}        cloud.progress {}      cloud.cancel {}      cloud.refresh {wait?}
+cloud.restore      {dir, provider, config, passphrase, wait?}   cloud.finishRestore {}
+cloud.status       {}
+```
+
+- **In the library:** `cloud/vault.enc` (sealed), `cloud/settings.json` (caps, speed, priority, copies, client ids,
+  device id; nothing secret), `cloud/manifest.enc` (this device's copy of the manifest).
+- **What a backup sends:** the catalog files (`catalog.snap`, `catalog.log`, `presets.json`, `prefs.json`, `view.json`),
+  a `library.info` record (the library's folder) and the cloud settings, to every account; each library photo's
+  original (virtual copies share theirs), placed by free space, speed and priority, `originalCopies` copies on different
+  providers when there are enough of them; smart previews (one copy). Encrypted under the vault's data key; files
+  already stored with the same content are skipped, so a second backup of an unchanged library sends nothing. Photos
+  that left the library are marked trashed in the manifest (their blobs stay until a prune). Whole files are read into
+  memory, so a file over 4 GiB is skipped and reported. Every account also gets the vault and an `account.json` naming
+  its id in the vault.
+- **Accounts without a known size** (a folder, some WebDAV servers) get originals only once the user sets a cap:
+  placement never guesses free space.
+- **An account that fails** (an unplugged disk, a revoked sign-in) is reported in `cloud.status` and skipped; the
+  others still take the backup. A missing folder is never created except when the account is added.
+- **Restore** needs one account (its current credentials) and the passphrase: the vault on it opens every other
+  account, the newest manifest is read, and the library is written into a new folder: the catalog files,
+  originals that were inside the old library at the same place, the others under `Restored Originals/<their old path>`,
+  smart previews. Nothing is written outside that folder. `cloud.finishRestore` (automatic with `wait`) opens it and
+  relinks the originals with Find Missing Photos. A damaged copy is skipped for another account's copy.
+- **Rotated refresh tokens** (Microsoft) are saved back into the vault after each job.
+- **Limits now:** one device writes at a time (phase 5 adds a lease); the passphrase is kept in memory while unlocked
+  (to reseal the vault when accounts change); quotas are read at the start of each job, not watched.
+
 ## Testing
 
-`cargo test -p lightcraft-cloud` runs everything offline: the provider contract against the memory and folder
+`cargo test -p lightcraft-cloud` and `cargo test -p lightcraft-engine tests_cloud` run everything offline: the provider contract against the memory and folder
 providers and fakes of Google Drive, Microsoft Graph and Dropbox (with dropped chunks, lost answers, rate limits,
 expired and rotated tokens, hostile addresses and the sign-in redirect), SigV4 against fixed vectors, the HTTP client against a local echo server. `tests/live.rs` runs the same
 contract against real servers, only when one is configured:

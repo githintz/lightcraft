@@ -356,6 +356,10 @@ impl OneDriveProvider {
 }
 
 impl Provider for OneDriveProvider {
+    fn refresh_token(&self) -> Option<&str> {
+        Some(self.tokens.refresh_token())
+    }
+
     fn info(&self) -> ProviderInfo {
         ProviderInfo { provider: "onedrive".into(), label: self.label.clone(), max_file_size: Some(MAX_FILE_SIZE) }
     }

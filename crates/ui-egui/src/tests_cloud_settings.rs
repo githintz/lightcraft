@@ -1,0 +1,99 @@
+//! Settings ▸ Cloud driven as a person would: the passphrase typed twice (Set Up waits until
+//! the two match), a folder account added from the folder picker and given a size limit, Back Up
+//! Now with its result, then Lock and Unlock.
+
+#![cfg(not(target_arch = "wasm32"))]
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde_json::{Value, json};
+
+use crate::headless::Headless;
+use crate::state::Dialog;
+use crate::{LightcraftApp, Services};
+
+const T: Duration = Duration::from_secs(20);
+const PASS: &str = "correct horse battery";
+
+fn temp(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("lc-ui-cloud-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn click(h: &mut Headless, id: &str) {
+    let r = h.request("ui.clickWidget", json!({ "id": id }), T);
+    assert_eq!(r["ok"], true, "{id}: {r}");
+    h.step();
+    h.step();
+}
+
+fn type_into(h: &mut Headless, field: &str, text: &str) {
+    click(h, field);
+    h.request("ui.text", json!({ "text": text }), T);
+    h.step();
+}
+
+fn status(h: &mut Headless) -> Value {
+    h.app.session.execute("cloud.status", &Value::Null).unwrap()
+}
+
+#[test]
+fn set_up_add_a_folder_back_up_lock_and_unlock_from_settings() {
+    let (lib, acc) = (temp("lib"), temp("acc"));
+    let mut session = lightcraft_engine::Session::new().with_fs();
+    session.open_library(&lib, false).unwrap();
+    let picked = acc.join("LightCraft").to_string_lossy().to_string();
+    let services = Services { png: None, pick_folder: Some(Box::new(move || Some(picked.clone()))), ..Default::default() };
+    let mut h = Headless::new(LightcraftApp::new(session, services), [1400.0, 900.0], 1.0);
+    h.app.ui.dialog = Some(Dialog::Settings { tab: "cloud".into() });
+    h.step();
+    // the widget list switches on with the first request
+    h.request("ui.widgets", json!({}), T);
+    h.step();
+
+    // a passphrase that doesn't match its repeat sets nothing up
+    type_into(&mut h, "field:cloudPassphrase", PASS);
+    type_into(&mut h, "field:cloudPassphraseRepeat", "correct horse");
+    click(&mut h, "button:cloudSetup");
+    assert_eq!(status(&mut h)["configured"], false);
+    type_into(&mut h, "field:cloudPassphraseRepeat", " battery");
+    click(&mut h, "button:cloudSetup");
+    assert_eq!((status(&mut h)["configured"].clone(), status(&mut h)["unlocked"].clone()), (json!(true), json!(true)));
+
+    // a folder from the picker, then a size limit so originals can go there
+    h.step();
+    click(&mut h, "button:cloudAddFolder");
+    let accounts = status(&mut h)["accounts"].clone();
+    assert_eq!(accounts.as_array().map(Vec::len), Some(1), "{accounts}");
+    assert_eq!(accounts[0]["label"], "LightCraft");
+    h.step();
+    click(&mut h, "button:cloudCap-0-2");
+    assert_eq!(status(&mut h)["accounts"][0]["settings"]["cap"], 200u64 * 1_073_741_824);
+
+    // Back Up Now runs on a worker; the tab shows the result when it ends
+    click(&mut h, "button:cloudBackup");
+    assert!(h.step_until(T, |h| h.app.session.cloud.job.as_ref().is_some_and(|j| !j.running())), "the backup ends");
+    h.step();
+    let st = status(&mut h);
+    assert!(st["lastBackup"].is_string(), "{st}");
+    assert!(acc.join("LightCraft/vault.enc").is_file());
+
+    // Lock, then the passphrase unlocks it again (the buttons are laid out once the job ended)
+    h.step();
+    click(&mut h, "button:cloudLock");
+    assert_eq!(status(&mut h)["unlocked"], false);
+    h.step();
+    type_into(&mut h, "field:cloudUnlock", PASS);
+    click(&mut h, "button:cloudUnlock");
+    assert_eq!(status(&mut h)["unlocked"], true);
+    // nothing typed here reaches the journal
+    assert!(h.app.session.journal.iter().all(|(id, p)| !id.starts_with("cloud.") && !p.to_string().contains(PASS)));
+
+    drop(h);
+    for d in [lib, acc] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

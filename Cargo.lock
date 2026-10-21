@@ -3149,6 +3149,7 @@ dependencies = [
  "harfrust",
  "libc",
  "lightcraft-catalog",
+ "lightcraft-cloud",
  "lightcraft-codecs",
  "lightcraft-color",
  "lightcraft-denoise",
