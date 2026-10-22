@@ -129,6 +129,12 @@ fn files_and_folders_round_trip_through_the_accounts() {
     assert_eq!(blobs_under(&acc1) + blobs_under(&acc2), 2, "only the drive metadata is left");
     assert_eq!(names(&mut s, "root"), Vec::<String>::new());
 
+    // drive.wait returns once everything queued is stored
+    s.execute("drive.upload", &json!({"path": src.join("notes.txt").to_string_lossy()})).unwrap();
+    let t = s.execute("drive.wait", &json!({})).unwrap();
+    assert_eq!((t["busy"].as_bool(), t["unsynced"].as_bool()), (Some(false), Some(false)), "{t}");
+    assert_eq!(names(&mut s, "root"), ["notes.txt"]);
+
     // a staged upload must come from the inbox
     assert!(s.execute("drive.upload", &json!({"path": src.join("notes.txt").to_string_lossy(), "staged": true})).is_err());
     assert!(src.join("notes.txt").is_file(), "never removes a file outside the inbox");
@@ -204,4 +210,22 @@ fn the_drive_comes_back_from_the_accounts_alone() {
     settle(&mut s);
     assert_eq!(names(&mut s, "root"), ["Docs", "a.txt"]);
     assert!(acc1.join("lc/vault.enc").exists() || acc1.join("lc/manifest").is_dir());
+}
+
+#[test]
+fn the_session_and_the_worker_can_save_the_same_file_at_once() {
+    // both used one temp name per process, so one of two simultaneous saves failed
+    let dir = temp_dir("atomic");
+    let path = dir.join("manifest.enc");
+    let threads: Vec<_> = (0..8u8)
+        .map(|i| {
+            let path = path.clone();
+            std::thread::spawn(move || (0..50).map(|_| crate::cloud::write_atomic(&path, &[i; 4096])).collect::<Result<Vec<_>, _>>())
+        })
+        .collect();
+    for t in threads {
+        assert!(t.join().unwrap().is_ok());
+    }
+    assert_eq!(std::fs::read(&path).unwrap().len(), 4096);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temp files left behind");
 }

@@ -43,6 +43,7 @@ drive.upload      {path, parent?, name?, level?, copies?, staged?}   a file (que
 drive.download    {id} → {task}              drive.file {task} → {path, name, size}
 drive.transfers   {}                         drive.cancel {task}        drive.clearTransfers {}
 drive.sync        {}                         read the accounts' copy (another device, a restore)
+drive.wait        {timeoutMs?}               block until queued transfers are stored (scripts: before exiting)
 ```
 
 - **Folders:** `root` is the top of the drive; `lib`, `lib.originals`, `lib.previews`, `lib.catalog` and
@@ -59,6 +60,9 @@ drive.sync        {}                         read the accounts' copy (another de
   the worker's queue is empty (`drive.transfers` → `unsynced`).
 - **Upload speed** (`level`: instant … archive) and **copies** (1–8, on different providers) are per upload; the
   dashboard's Settings pick its defaults.
+- **Scripts:** transfers run on a worker thread, so a `lightcraft-cli run` that uploads ends with `drive.wait` (or passes
+  `wait=true` to `drive.upload`); otherwise the process can exit with uploads still queued (nothing is half-stored:
+  an entry is recorded only once its file is on an account).
 
 ## How it shares the storage with backups
 

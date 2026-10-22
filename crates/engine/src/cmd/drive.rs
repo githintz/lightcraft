@@ -742,12 +742,18 @@ fn upload(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
         changed(s, &dir, C)?;
+        if super::bool_or(p, "wait", false) {
+            wait_idle(s, &Value::Null)?;
+        }
         return Ok(json!({"folder": top, "tasks": tasks}));
     }
     if !source.is_file() {
         return Err(bad(C, format!("{} is not a file", source.display())));
     }
     let (task, id, name) = queue_upload(s, &dir, source, parent, &name, level, copies, staged, C)?;
+    if super::bool_or(p, "wait", false) {
+        wait_idle(s, &Value::Null)?;
+    }
     Ok(json!({"task": task, "id": id, "name": name}))
 }
 
@@ -887,6 +893,23 @@ fn status(s: &mut Session, _: &Value) -> Result<Value> {
     }))
 }
 
+/// Block until the worker has done everything queued and saved to the accounts (CLI, MCP and
+/// scripts, whose process would otherwise end with transfers still queued).
+fn wait_idle(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "drive.wait";
+    let dir = ready(s, C)?;
+    let timeout = std::time::Duration::from_millis(p.get("timeoutMs").and_then(Value::as_u64).unwrap_or(3_600_000));
+    let start = std::time::Instant::now();
+    while s.cloud.drive.transfers.busy() {
+        if start.elapsed() >= timeout {
+            return Err(bad(C, "the drive's transfers are still running"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    s.cloud.absorb_drive(&dir);
+    transfers(s, &Value::Null)
+}
+
 fn sync(s: &mut Session, _: &Value) -> Result<Value> {
     const C: &str = "drive.sync";
     let dir = ready(s, C)?;
@@ -909,7 +932,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(query "drive.restore", "Restore Drive Items", [], None, "{ids} — out of the trash, into their folder (or the top when it is gone)", always, restore),
         cmd!(query "drive.delete", "Delete Drive Items Forever", [], None, "{ids} — with everything in them; stored copies are deleted in the background → {deleted}", always, delete),
         cmd!(query "drive.emptyTrash", "Empty Drive Trash", [], None, "{} → {deleted}", always, empty_trash),
-        cmd!(query "drive.upload", "Upload to Drive", [], None, "{path, parent?: folder id, name?, level?: instant|fast|standard|slow|archive, copies?: 1–8, staged?: bool (a file in the inbox, removed once stored)} — a file is queued → {task, id, name}; a folder is made with its folders and its files queued → {folder, tasks}", always, upload),
+        cmd!(query "drive.upload", "Upload to Drive", [], None, "{path, parent?: folder id, name?, level?: instant|fast|standard|slow|archive, copies?: 1–8, staged?: bool (a file in the inbox, removed once stored), wait?: bool (until stored)} — a file is queued → {task, id, name}; a folder is made with its folders and its files queued → {folder, tasks}", always, upload),
         cmd!(query "drive.download", "Download from Drive", [], None, "{id} — queue decrypting the file into the outbox → {task}; when done, drive.file {task} gives its path", always, download),
         cmd!(query "drive.transfers", "Drive Transfers", [], None, "{} → {tasks: [{id, kind: upload|download|delete|sync, name, entry, size, state: queued|running|done|failed|cancelled, error, copies, at, ready}], busy, unsynced, syncError}", always, transfers),
         cmd!(query "drive.file", "Downloaded Drive File", [], None, "{task} → {path, name, size}", always, file),
@@ -923,6 +946,7 @@ pub fn specs() -> Vec<CommandSpec> {
             s.cloud.drive.transfers.clear_finished();
             Ok(Value::Null)
         }),
+        cmd!(query "drive.wait", "Wait for Drive Transfers", [], None, "{timeoutMs?} — block until every queued transfer is done and saved to the accounts (scripts: run it before the process ends) → drive.transfers", always, wait_idle),
         cmd!(query "drive.sync", "Sync Drive", [], None, "{} — read the accounts' copy of the drive (another device, a restore) and save this one → {task}", always, sync),
     ]
 }

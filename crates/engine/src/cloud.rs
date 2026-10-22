@@ -178,7 +178,9 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    // unique per call: two threads may save the same file at once (the drive's worker and the session)
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
     let result = (|| {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(data)?;

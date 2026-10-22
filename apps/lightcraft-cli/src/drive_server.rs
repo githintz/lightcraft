@@ -434,7 +434,16 @@ fn send_download(task: &str, req: &Request, out: &mut TcpStream, ctx: &Ctx) -> s
     let mut extra = vec![
         ("Content-Disposition", disposition),
         ("Cache-Control", "private, max-age=600".to_string()),
-        ("Content-Security-Policy", "sandbox; default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'".to_string()),
+        // Chrome's PDF viewer won't open a sandboxed response; a PDF runs no page script anyway
+        (
+            "Content-Security-Policy",
+            if shown == Some("application/pdf") {
+                "default-src 'none'; object-src 'self'"
+            } else {
+                "sandbox; default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'"
+            }
+            .to_string(),
+        ),
         ("Accept-Ranges", "bytes".to_string()),
     ];
     let content_type = shown.unwrap_or("application/octet-stream");

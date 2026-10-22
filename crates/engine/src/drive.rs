@@ -552,7 +552,7 @@ impl Worker {
         self.transfers.meta_dirty.store(false, Ordering::Relaxed);
         let meta = serde_json::to_vec(&*lock(&self.meta)).map_err(|e| e.to_string())?;
         let library = self.ctx.library.clone();
-        let (shared, transfers) = (self.manifest.clone(), self.transfers.clone());
+        let (shared, transfers, shared_meta) = (self.manifest.clone(), self.transfers.clone(), self.meta.clone());
         let fleet = self.fleet()?;
         let old = fleet.manifest.get(META_ID);
         let item = Item { id: META_ID.into(), name: META_FILE.into(), level: Availability::Instant, copies: 1, everywhere: true };
@@ -576,10 +576,13 @@ impl Worker {
                 q.insert(id.clone(), Err(e.to_string()));
             }
         }
-        let plain = fleet.manifest.to_snapshot().map_err(|e| e.to_string())?;
+        // the session's copy: it holds this save and anything changed since
+        let plain = lock(&shared).to_snapshot().map_err(|e| e.to_string())?;
         let sealed = crypto::encrypt(&fleet.data_key, &plain, &mut OsRandom).map_err(|e| e.to_string())?;
         write_atomic(&cloud::dir(&library).join(cloud::MANIFEST_FILE), &sealed).map_err(|e| format!("can't save the manifest: {e}"))?;
-        let _ = write_atomic(&cloud::dir(&library).join(META_FILE), &meta);
+        if let Ok(now) = serde_json::to_vec(&*lock(&shared_meta)) {
+            let _ = write_atomic(&cloud::dir(&library).join(META_FILE), &now);
+        }
         transfers.synced.fetch_max(fleet.manifest.clock(), Ordering::Relaxed);
         Ok(())
     }
