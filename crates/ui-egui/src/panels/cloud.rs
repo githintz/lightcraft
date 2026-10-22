@@ -25,6 +25,8 @@ struct Form {
     /// Which sign-in form is open ("" = none) and its client id.
     signing: String,
     client_id: String,
+    /// Google's token endpoint wants the desktop client's secret too (not secret there: RFC 8252 §8.5).
+    client_secret: String,
 }
 
 fn form_id() -> egui::Id {
@@ -217,12 +219,18 @@ fn accounts(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, ctx: &egui::
     if !form.signing.is_empty() {
         let kind = form.signing.clone();
         row(ui, t, "Client ID", |ui| TextField::singleline("field:cloudClientId", &mut form.client_id).width(300.0).show(ui));
+        if kind == "gdrive" {
+            row(ui, t, "Client secret", |ui| {
+                TextField::singleline("field:cloudClientSecret", &mut form.client_secret).password(true).width(300.0).show(ui)
+            });
+        }
         ui.horizontal(|ui| {
             ui.add_space(LABEL_W);
-            let r = ui.add_enabled(!form.client_id.trim().is_empty(), egui::Button::new(crate::i18n::tr("Sign In in the Browser")));
+            let ready = !form.client_id.trim().is_empty() && (kind != "gdrive" || !form.client_secret.trim().is_empty());
+            let r = ui.add_enabled(ready, egui::Button::new(crate::i18n::tr("Sign In in the Browser")));
             register(ui.ctx(), "button:cloudSignInGo", r.rect);
             if r.clicked()
-                && let Some(v) = run(app, ctx, "cloud.signIn", json!({"provider": kind, "clientId": form.client_id.trim()}))
+                && let Some(v) = run(app, ctx, "cloud.signIn", json!({"provider": kind, "clientId": form.client_id.trim(), "clientSecret": Some(form.client_secret.trim()).filter(|s| !s.is_empty())}))
             {
                 if let Some(url) = v["url"].as_str()
                     && let Err(e) = crate::links::open(app, url)
@@ -230,6 +238,7 @@ fn accounts(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, ctx: &egui::
                     app.toast(ctx, format!("Open this address in a browser: {url} ({e})"));
                 }
                 form.signing.clear();
+                form.client_secret.clear();
             }
         });
         hint(ui, t, "The client id of your app registration with this provider (docs/cloud-storage.md says how to make one).");

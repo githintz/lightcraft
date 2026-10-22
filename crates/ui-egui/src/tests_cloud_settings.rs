@@ -97,3 +97,31 @@ fn set_up_add_a_folder_back_up_lock_and_unlock_from_settings() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// Google sign-in needs the desktop client's secret as well as its id: Sign In stays off until
+/// both are typed, then starts a browser sign-in (a loopback listener; nothing goes out).
+#[test]
+fn google_sign_in_asks_for_the_client_secret() {
+    let lib = temp("gdrive");
+    let mut session = lightcraft_engine::Session::new().with_fs();
+    session.open_library(&lib, false).unwrap();
+    session.execute("cloud.setup", &json!({ "passphrase": PASS })).unwrap();
+    let mut h = Headless::new(LightcraftApp::new(session, Services { png: None, ..Default::default() }), [1400.0, 900.0], 1.0);
+    h.app.ui.dialog = Some(Dialog::Settings { tab: "cloud".into() });
+    h.step();
+    h.request("ui.widgets", json!({}), T);
+    h.step();
+    click(&mut h, "button:cloudSignIn-gdrive");
+    type_into(&mut h, "field:cloudClientId", "1234-test.apps.googleusercontent.com");
+    click(&mut h, "button:cloudSignInGo");
+    assert!(h.app.session.cloud.sign_in.is_none(), "no sign-in without the secret");
+    type_into(&mut h, "field:cloudClientSecret", "GOCSPX-test");
+    click(&mut h, "button:cloudSignInGo");
+    let url = h.app.session.cloud.sign_in.as_ref().map(|s| s.url.clone()).unwrap_or_default();
+    assert!(url.starts_with("https://accounts.google.com/") && url.contains("client_id=1234-test"), "{url}");
+    assert!(!url.contains("GOCSPX"), "the secret never goes in the browser's address");
+    h.app.session.execute("cloud.cancel", &json!({})).unwrap();
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(lib);
+}

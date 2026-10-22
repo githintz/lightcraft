@@ -106,7 +106,9 @@ What each kind of file asks for by default:
 - **Quota:** `about.storageQuota`, the whole account (Drive, Gmail and Photos share it); no limit for accounts without
   one. Refreshing it (for placement) is the engine's job in phase 3; a few minutes' staleness is fine.
 - **Client id:** each build needs a Google Cloud OAuth client of type *Desktop app* (public, per RFC 8252). Users can
-  bring their own.
+  bring their own. Google's token endpoint also wants that client's secret (not a secret for desktop clients, RFC
+  8252 §8.5): Settings ▸ Cloud asks for it with the client id, and the vault keeps it with the account. While the
+  OAuth consent screen is in "Testing", add your Google account as a test user (and refresh tokens expire after 7 days).
 
 ### OneDrive
 
@@ -119,10 +121,13 @@ What each kind of file asks for by default:
   redirects are pre-authenticated addresses and are sent no credentials; they must be https. A listing's next page must
   come from Graph itself.
 - **Errors:** 429 and 5xx retried with `Retry-After`; `quotaLimitReached` / 507 is "the storage account is full".
-- **Registration:** a "Mobile and desktop applications" platform with the loopback redirect URI `http://127.0.0.1`
-  (sign-in sends `http://127.0.0.1:<port>`; Microsoft ignores the port of loopback redirect URIs). If the portal won't
-  take it, add it in the app manifest; Microsoft's "redirect URI restrictions" page is the reference. Not yet tried
-  against a real registration.
+- **Registration** (Microsoft Entra admin center ▸ App registrations): supported account types "Accounts in any
+  organizational directory and personal Microsoft accounts" (the `common` endpoint); API permissions: Microsoft Graph
+  delegated `Files.ReadWrite.AppFolder` and `offline_access`; no secret. Redirect URI `http://127.0.0.1` of type
+  `InstalledClient` (sign-in sends `http://127.0.0.1:<port>`; Microsoft ignores the port of loopback redirect URIs).
+  The portal's form doesn't take an `http://127.0.0.1` address, so add it in the app's **Manifest**:
+  `"replyUrlsWithType": [{"url": "http://127.0.0.1", "type": "InstalledClient"}]` (Microsoft's "Redirect URI (reply
+  URL) best practices and limitations" page). Not yet tried against a real registration.
 
 ### Dropbox
 
