@@ -189,6 +189,14 @@ impl TokenSource {
     pub fn invalidate(&mut self) {
         self.access = None;
     }
+
+    /// [`TokenSource::invalidate`], unless the rejected `token` was already replaced (by another
+    /// thread sharing this source): a provider that rotates refresh tokens must not refresh twice.
+    pub fn invalidate_if(&mut self, token: &str) {
+        if self.access.as_ref().is_some_and(|(t, _)| t == token) {
+            self.access = None;
+        }
+    }
 }
 
 /// The PKCE `code_challenge` for a verifier (method `S256`).

@@ -44,6 +44,10 @@ pub struct State {
     pub chunks: u32,
     /// `folder_is_public` of every folder made.
     pub made_public: Vec<i64>,
+    /// Bytes of file content the account may still send today (`None`: no limit); then 509.
+    pub bandwidth_left: Option<u64>,
+    /// Bytes of file content the fake sent (whole downloads count everything they reply with).
+    pub bytes_sent: u64,
     /// Content (MD5) OpenDrive already holds: `create_file` answers RequireHashOnly.
     pub dedup: bool,
 }
@@ -85,6 +89,25 @@ impl State {
         self.refreshes += 1;
         self.refresh = format!("rt-{}", self.refreshes);
         json!({"access_token": access, "expires_in": 86400, "token_type": "bearer", "scope": null, "refresh_token": self.refresh})
+    }
+
+    /// Put a file at `path` (folders made as needed), as if the user had uploaded it; its id.
+    pub fn add_file(&mut self, path: &str, data: &[u8]) -> String {
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+        let mut parent = "0".to_string();
+        for seg in dir.split('/').filter(|s| !s.is_empty()) {
+            parent = match self.folders.iter().find(|(_, (p, n))| *p == parent && n == seg) {
+                Some((k, _)) => k.clone(),
+                None => {
+                    let id = self.id();
+                    self.folders.insert(id.clone(), (parent, seg.to_string()));
+                    id
+                }
+            };
+        }
+        let id = self.id();
+        self.files.insert(id.clone(), File { folder: parent, name: name.to_string(), data: data.to_vec() });
+        id
     }
 
     pub fn folder_by_path(&self, path: &str) -> Option<String> {
@@ -284,9 +307,37 @@ fn serve(state: &Shared, conn: &mut TcpStream, req: &Request) {
         },
         ("GET", ["download", "file.json", id]) => {
             assert_eq!(req.query.get("session_id").map(String::as_str), Some("OAUTH"));
+            let Some(f) = s.files.get(*id) else { return error(conn, 404, "File does not exist.") };
+            let data = f.data.clone();
+            if let Some(left) = s.bandwidth_left {
+                if left == 0 {
+                    return error(conn, 509, "Bandwidth limit has exceeded.");
+                }
+                // what this reply sends counts in full, however little the client reads
+                s.bandwidth_left = Some(left.saturating_sub(data.len() as u64));
+            }
+            match req.query.get("offset").map(|o| o.parse::<usize>().unwrap()) {
+                None => {
+                    s.bytes_sent += data.len() as u64;
+                    reply(conn, 200, &[("Content-Type", "application/octet-stream".into())], &data)
+                }
+                Some(o) if o >= data.len() => error(conn, 416, "Requested range not satisfiable."),
+                Some(o) => {
+                    let range = format!("bytes {o}-{}/{}", data.len() - 1, data.len());
+                    s.bytes_sent += (data.len() - o) as u64;
+                    reply(conn, 206, &[("Content-Range", range)], &data[o..])
+                }
+            }
+        }
+        ("GET", ["file", "info.json", id]) => {
+            assert_eq!(req.query.get("session_id").map(String::as_str), Some("OAUTH"));
             match s.files.get(*id) {
-                Some(f) => reply(conn, 200, &[("Content-Type", "application/octet-stream".into())], &f.data.clone()),
-                None => error(conn, 404, "File does not exist."),
+                Some(f) => {
+                    let mut v = State::file_json(id, f);
+                    v["FileHash"] = json!(md5(&f.data));
+                    json_reply(conn, 200, v)
+                }
+                None => error(conn, 404, "File not found."),
             }
         }
         other => panic!("unexpected call {other:?}"),

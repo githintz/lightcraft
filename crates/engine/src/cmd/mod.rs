@@ -8,6 +8,8 @@ mod before;
 pub(crate) mod browse;
 #[cfg(not(target_arch = "wasm32"))]
 mod cloud;
+#[cfg(not(target_arch = "wasm32"))]
+mod cloud_albums;
 mod color;
 pub(crate) mod convert;
 mod cull;
@@ -158,6 +160,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(face_recognize::specs());
         #[cfg(not(target_arch = "wasm32"))]
         v.extend(cloud::specs());
+        #[cfg(not(target_arch = "wasm32"))]
+        v.extend(cloud_albums::specs());
         v
     })
 }

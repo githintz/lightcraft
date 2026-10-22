@@ -28,6 +28,7 @@ pub mod accounts;
 mod availability;
 pub mod backup;
 mod blob;
+pub mod browse;
 pub mod contract;
 pub mod crypto;
 #[cfg(not(target_arch = "wasm32"))]
@@ -56,6 +57,7 @@ pub mod webdav;
 
 pub use availability::{Availability, SpeedClass};
 pub use blob::{ContentId, ObjectName, fetch_blob, store_blob};
+pub use browse::{Browse, BrowseDir, BrowseFile, FolderBrowser};
 pub use error::{CloudError, Result};
 pub use folder::FolderProvider;
 pub use manifest::{Entry, EntryKind, Manifest, Op, OpKind, Stamp};

@@ -183,6 +183,12 @@ The 9Drive web app (Zenhosta, Apache-2.0; a server-hosted Express + MySQL gatewa
 accounts) served as a reference for which Drive calls a multi-account gateway needs. No code was taken from it: this is
 written from Google's public REST documentation.
 
+## Albums from photos already in an account
+
+Photos the user already keeps in an account (folders by trip, possibly in several trees with copies) can be scanned
+without changing or downloading them and planned into albums: [cloud-albums.md](cloud-albums.md)
+(`cloud.scanFolders`, `cloud.planAlbums`).
+
 ## Using it (phase 3)
 
 Everything is a command, so the CLI, the control channel and MCP drive it; **Settings ▸ Cloud** calls the same ones:

@@ -18,6 +18,7 @@
 //! 429, 423 (a chunk still being written) and 5xx answers are retried with backoff.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use lightcraft_fetch::http::{Response, Url};
@@ -25,6 +26,7 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::browse::{Browse, BrowseDir, BrowseFile};
 use crate::net::{MAX_META_BODY, Net, form, hex, is_local, retry_after};
 use crate::oauth::{OAuthClient, TokenSource, Tokens};
 use crate::{CloudError, Listed, ObjectName, Provider, ProviderInfo, Quota, RemoteRef, Result};
@@ -186,7 +188,11 @@ fn uploaded_offset(body: &[u8]) -> Option<u64> {
 }
 
 pub struct OpenDriveProvider {
-    tokens: TokenSource,
+    /// Shared by the clones of an [`OpenDriveBrowser`]: OpenDrive replaces the refresh token on
+    /// every refresh, so parallel workers must refresh through one source.
+    tokens: Arc<Mutex<TokenSource>>,
+    /// The refresh token as of the last request (for [`Provider::refresh_token`]).
+    refresh: String,
     api: Url,
     folder: String,
     label: String,
@@ -207,7 +213,8 @@ impl OpenDriveProvider {
         }
         let client = OAuthClient::opendrive(token_url(&config.api));
         Ok(OpenDriveProvider {
-            tokens: TokenSource::new(client, config.refresh_token),
+            refresh: config.refresh_token.clone(),
+            tokens: Arc::new(Mutex::new(TokenSource::new(client, config.refresh_token))),
             api,
             folder: config.folder,
             label: label.into(),
@@ -229,7 +236,7 @@ impl OpenDriveProvider {
 
     /// The refresh token in use.
     pub fn refresh_token(&self) -> &str {
-        self.tokens.refresh_token()
+        &self.refresh
     }
 
     /// The app folder, made (private) when missing.
@@ -245,7 +252,12 @@ impl OpenDriveProvider {
         let mut refreshed = false;
         let mut attempt = 0u32;
         loop {
-            let token = self.tokens.bearer(&self.net)?;
+            let token = {
+                let mut t = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
+                let token = t.bearer(&self.net)?;
+                t.refresh_token().clone_into(&mut self.refresh);
+                token
+            };
             let mut q: Vec<(&str, &str)> = query.to_vec();
             q.push(("access_token", token.as_str()));
             let url = Url { path: format!("{}{route}?{}", self.api.path.trim_end_matches('/'), form(&q)), ..self.api.clone() };
@@ -263,7 +275,7 @@ impl OpenDriveProvider {
             let resp = self.net.send(method, &url, &headers, &bytes)?;
             match resp.status {
                 401 if !refreshed => {
-                    self.tokens.invalidate();
+                    self.tokens.lock().unwrap_or_else(PoisonError::into_inner).invalidate_if(&token);
                     refreshed = true;
                 }
                 423 | 429 | 500 | 502 | 503 | 504 if attempt < MAX_RETRIES => {
@@ -530,6 +542,118 @@ impl OpenDriveProvider {
     }
 }
 
+/// Read-only access to the account's own folders (the photos already there), from a signed-in
+/// [`OpenDriveProvider`]: only the reading calls are reachable through it.
+pub struct OpenDriveBrowser(OpenDriveProvider);
+
+impl OpenDriveProvider {
+    /// This account as a [`Browse`]: list folders, read hashes and byte ranges, nothing else.
+    pub fn into_browser(self) -> OpenDriveBrowser {
+        OpenDriveBrowser(self)
+    }
+}
+
+impl OpenDriveBrowser {
+    /// The refresh token in use (OpenDrive replaces it on every refresh: the vault must keep it).
+    pub fn refresh_token(&self) -> String {
+        self.0.tokens.lock().unwrap_or_else(PoisonError::into_inner).refresh_token().to_string()
+    }
+
+    /// Another browser on the same account for a parallel worker: its own connection settings,
+    /// the same tokens.
+    pub fn worker(&self) -> OpenDriveBrowser {
+        let p = &self.0;
+        OpenDriveBrowser(OpenDriveProvider {
+            tokens: p.tokens.clone(),
+            refresh: p.refresh.clone(),
+            api: p.api.clone(),
+            folder: p.folder.clone(),
+            label: p.label.clone(),
+            net: Net { cancel: p.net.cancel.clone(), ..Net::default() },
+            retry_base: p.retry_base,
+            chunk: p.chunk,
+            folders: HashMap::new(),
+        })
+    }
+
+    pub fn net(&self) -> &Net {
+        &self.0.net
+    }
+
+    pub fn set_net(&mut self, net: Net) {
+        self.0.net = net;
+    }
+}
+
+/// A file or folder name from a listing, kept only when it can be part of a path.
+fn plain_name(v: &Value) -> Option<String> {
+    let n = v.as_str()?;
+    (!n.is_empty() && n.len() <= 1024 && !n.contains('/') && n != "." && n != ".." && !n.chars().any(char::is_control)).then(|| n.to_string())
+}
+
+impl Browse for OpenDriveBrowser {
+    fn kind(&self) -> &str {
+        "opendrive"
+    }
+
+    fn folder(&mut self, path: &str) -> Result<String> {
+        let path = path.trim_matches('/');
+        if path.is_empty() {
+            return Ok("0".into());
+        }
+        self.0.find_folder(path)?.ok_or(CloudError::NotFound)
+    }
+
+    fn list(&mut self, folder: &str) -> Result<BrowseDir> {
+        let id = checked_id(&json!(folder), "folder")?;
+        let mut resp = self.0.call("GET", &format!("/folder/list.json/OAUTH/{id}"), &[], Body::None)?;
+        let v = self.0.json("list", &mut resp)?;
+        let mut out = BrowseDir::default();
+        for f in v["Folders"].as_array().map(Vec::as_slice).unwrap_or_default() {
+            if let (Ok(id), Some(name)) = (checked_id(&f["FolderID"], "folder"), plain_name(&f["Name"])) {
+                out.folders.push((id, name));
+            }
+        }
+        for f in v["Files"].as_array().map(Vec::as_slice).unwrap_or_default() {
+            if let (Ok(id), Some(name)) = (checked_id(&f["FileId"], "file"), plain_name(&f["Name"])) {
+                let modified = f["DateModified"].as_str().map(str::to_string).or_else(|| number(&f["DateModified"]).map(|n| n.to_string()));
+                out.files.push(BrowseFile { id, name, size: number(&f["Size"]).unwrap_or(0), modified });
+            }
+        }
+        Ok(out)
+    }
+
+    fn content_hash(&mut self, file: &str) -> Result<Option<String>> {
+        let id = checked_id(&json!(file), "file")?;
+        let mut resp = self.0.call("GET", &format!("/file/info.json/{id}"), &[("session_id", "OAUTH")], Body::None)?;
+        let v = self.0.json("file info", &mut resp)?;
+        Ok(v["FileHash"]
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .filter(|h| !h.is_empty() && h.len() <= 128 && h.bytes().all(|b| b.is_ascii_hexdigit())))
+    }
+
+    fn read_range(&mut self, file: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let id = checked_id(&json!(file), "file")?;
+        let off = offset.to_string();
+        let query: Vec<(&str, &str)> = if offset > 0 { vec![("session_id", "OAUTH"), ("offset", &off)] } else { vec![("session_id", "OAUTH")] };
+        let mut resp = self.0.call("GET", &format!("/download/file.json/{id}"), &query, Body::None)?;
+        match resp.status {
+            200 | 206 => {
+                // a server that ignored the offset would send the start of the file instead
+                if let Some(range) = resp.header("Content-Range")
+                    && !range.trim_start_matches("bytes ").starts_with(&format!("{offset}-"))
+                {
+                    return Err(CloudError::Corrupt(format!("OpenDrive sent the wrong part of the file ({range})")));
+                }
+                self.0.net.body_prefix(&mut resp, len.min(crate::browse::MAX_RANGE))
+            }
+            416 => Ok(Vec::new()),
+            _ => Err(self.0.error("download", &mut resp)),
+        }
+    }
+}
+
 /// A request body.
 enum Body {
     None,
@@ -553,7 +677,7 @@ fn multipart(data: &[u8]) -> Body {
 
 impl Provider for OpenDriveProvider {
     fn refresh_token(&self) -> Option<&str> {
-        Some(self.tokens.refresh_token())
+        Some(&self.refresh)
     }
 
     fn info(&self) -> ProviderInfo {

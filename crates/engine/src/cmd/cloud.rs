@@ -28,7 +28,7 @@ const OAUTH: &[&str] = &["gdrive", "onedrive", "dropbox"];
 /// What `cloud.signIn` signs in to: the browser sign-ins, and OpenDrive with its password.
 const SIGN_IN: &[&str] = &["gdrive", "onedrive", "dropbox", "opendrive"];
 
-fn library_dir(s: &Session, c: &str) -> Result<PathBuf> {
+pub(super) fn library_dir(s: &Session, c: &str) -> Result<PathBuf> {
     match &s.library {
         Some(l) if l.on_disk => Ok(l.dir.clone()),
         _ => Err(bad(c, "cloud backup needs a library on disk")),
@@ -42,7 +42,7 @@ fn idle(s: &Session, c: &str) -> Result<()> {
     Ok(())
 }
 
-fn unlocked(s: &Session, c: &str) -> Result<()> {
+pub(super) fn unlocked(s: &Session, c: &str) -> Result<()> {
     if !s.cloud.unlocked() {
         return Err(bad(c, "the cloud vault is locked: unlock it with its passphrase"));
     }

@@ -65,6 +65,24 @@ impl Net {
         }
     }
 
+    /// The first `max` bytes of the body (all of it when shorter); the rest is never read (the
+    /// connection is dropped with the response).
+    pub fn body_prefix(&self, resp: &mut Response, max: u64) -> Result<Vec<u8>> {
+        let limits = Limits { connect: self.connect, stall: self.stall, cancel: &self.cancel };
+        let cap = usize::try_from(max).unwrap_or(usize::MAX).min(64 << 20);
+        let mut out = Vec::with_capacity(cap.min(1 << 20));
+        let mut buf = vec![0u8; 64 * 1024];
+        while out.len() < cap {
+            let want = (cap - out.len()).min(buf.len());
+            let n = resp.read(buf.get_mut(..want).unwrap_or_default(), &limits)?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(buf.get(..n).unwrap_or_default());
+        }
+        Ok(out)
+    }
+
     /// Turn a failed response into an error, with the server's message when it sends a short one.
     pub fn status_error(&self, what: &str, resp: &mut Response) -> CloudError {
         let status = resp.status;

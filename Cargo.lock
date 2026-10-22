@@ -3163,6 +3163,7 @@ dependencies = [
  "lightcraft-heif",
  "lightcraft-merge",
  "lightcraft-meta",
+ "lightcraft-organize",
  "lightcraft-pipeline",
  "lightcraft-preview",
  "lightcraft-raster",
@@ -3277,6 +3278,19 @@ dependencies = [
  "quick-xml 0.38.4",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "lightcraft-organize"
+version = "0.5.0"
+dependencies = [
+ "lightcraft-cloud",
+ "lightcraft-meta",
+ "lightcraft-tiff",
+ "md-5",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -326,3 +326,71 @@ fn opendrive_signs_in_with_its_password_backs_up_and_restores() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+#[path = "../../organize/tests/files/mod.rs"]
+mod camera_files;
+
+#[test]
+fn opendrive_folders_become_an_album_plan_without_changing_them() {
+    use fake_http::opendrive::{PASS as OD_PASS, USER, start};
+    let (state, api) = start();
+    let jpeg = |sub: &str| camera_files::camera_jpeg("6012345", "2019:07:03 14:22:01", sub, 20_000);
+    {
+        let mut st = state.lock().unwrap();
+        st.add_file(
+            "Photos A/Iceland 2019/RAW/DSC_0001.NEF",
+            &camera_files::camera_raw("NIKON CORPORATION", "NIKON Z 6", "6012345", "2019:07:03 14:22:01", "10", 300_000),
+        );
+        st.add_file("Photos A/Iceland 2019/JPG/DSC_0001.JPG", &jpeg("10"));
+        st.add_file("Photos A/Iceland 2019/JPG/DSC_0002.JPG", &jpeg("20"));
+        st.add_file("Photos B/2019/Iceland/DSC_0002.JPG", &jpeg("20"));
+        st.add_file("Photos B/2019/Iceland/DSC_0003.JPG", &jpeg("30"));
+        st.add_file("Photos B/Japan 2018/clip.MP4", &camera_files::camera_mp4(3_600_000_000, 50_000));
+    }
+    let files_before = state.lock().unwrap().files.len();
+    let lib = temp_dir("albums-lib");
+    let mut s = Session::new().with_fs();
+    s.open_library(&lib, false).unwrap();
+    s.execute("cloud.setup", &json!({"passphrase": PASS})).unwrap();
+    s.execute("cloud.signIn", &json!({"provider": "opendrive", "username": USER, "password": OD_PASS, "api": api})).unwrap();
+    assert_eq!(wait_for_sign_in(&mut s)["state"], "added");
+    let id = s.cloud.vault.as_ref().unwrap().accounts[0].id.clone();
+
+    assert!(s.execute("cloud.planAlbums", &json!({})).is_err(), "nothing scanned yet");
+    let r = s.execute("cloud.scanFolders", &json!({"account": id, "roots": ["Photos A", "/Photos B/"], "workers": 3, "wait": true})).unwrap();
+    assert_eq!((r["stop"].as_str(), r["found"].as_u64(), r["failed"].as_u64()), (Some("done"), Some(6), Some(0)), "{r}");
+    // the scan rotated the sign-in: the vault holds the token that works
+    assert_eq!(s.cloud.vault.as_ref().unwrap().accounts[0].config["refresh_token"], state.lock().unwrap().refresh.as_str());
+
+    let p = s.execute("cloud.planAlbums", &json!({})).unwrap();
+    assert_eq!((p["complete"].as_bool(), p["albums"].as_u64(), p["duplicateCopies"].as_u64()), (Some(true), Some(2), Some(1)), "{p}");
+    assert_eq!((p["photos"].as_u64(), p["videos"].as_u64()), (Some(4), Some(1)), "{p}");
+    let report = std::fs::read_to_string(p["report"].as_str().unwrap()).unwrap();
+    assert!(report.contains("Iceland 2019") && report.contains("Japan 2018"));
+    let plan: Value = serde_json::from_str(&std::fs::read_to_string(p["plan"].as_str().unwrap()).unwrap()).unwrap();
+    let iceland = plan["albums"].as_array().unwrap().iter().find(|a| a["name"] == "Iceland 2019").unwrap();
+    assert_eq!(iceland["sources"], json!(["Photos A/Iceland 2019", "Photos B/2019/Iceland"]));
+
+    // the user's edits are kept for the next plan
+    let p = s
+        .execute(
+            "cloud.planAlbums",
+            &json!({"edits": {"rename": [["Iceland 2019", "Iceland, July 2019"]], "keepBoth": ["Photos B/2019/Iceland/DSC_0002.JPG"]}}),
+        )
+        .unwrap();
+    assert_eq!(p["duplicateCopies"], 0);
+    let p = s.execute("cloud.planAlbums", &json!({})).unwrap();
+    assert!(std::fs::read_to_string(p["report"].as_str().unwrap()).unwrap().contains("Iceland, July 2019"));
+    assert!(s.execute("cloud.planAlbums", &json!({"edits": {"merge": "not a list"}})).is_err());
+
+    // a second scan reads nothing; nothing in the account changed; nothing was journaled
+    let r = s.execute("cloud.scanFolders", &json!({"account": id, "roots": ["Photos A", "Photos B"], "wait": true})).unwrap();
+    assert_eq!((r["toRead"].as_u64(), r["bytesRead"].as_u64()), (Some(0), Some(0)), "{r}");
+    assert_eq!(state.lock().unwrap().files.len(), files_before);
+    assert!(s.journal.iter().all(|(c, _)| !c.starts_with("cloud.")));
+    // only OpenDrive accounts and folders on this computer can be scanned
+    assert!(s.execute("cloud.scanFolders", &json!({"account": "nope", "roots": ["x"]})).is_err());
+    assert!(s.execute("cloud.scanFolders", &json!({"account": id, "roots": []})).is_err());
+    drop(s);
+    let _ = std::fs::remove_dir_all(lib);
+}

@@ -43,6 +43,7 @@ lightcraft-segment = { workspace = true, optional = true }
 lightcraft-fetch = { workspace = true }
 # opt-in cloud backup over the user's own storage accounts (docs/cloud-storage.md)
 lightcraft-cloud = { workspace = true }
+lightcraft-organize = { workspace = true }
 
 [features]
 # AI masks with SAM 3 (Object / Describe). Off for the web and CLI builds.

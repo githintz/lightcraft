@@ -1,0 +1,21 @@
+[package]
+name = "lightcraft-organize"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LightCraft organize (L2): scan photo folders in a storage account without changing them; plan albums by trip, with duplicates found"
+
+[lints]
+workspace = true
+
+[dependencies]
+lightcraft-cloud = { workspace = true }
+lightcraft-meta = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+lightcraft-tiff = { workspace = true }
+# the fake OpenDrive server of lightcraft-cloud's tests checks uploads by MD5
+md-5 = "0.10"

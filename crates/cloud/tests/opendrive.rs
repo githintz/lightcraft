@@ -11,6 +11,7 @@ mod common;
 use common::opendrive::{File, PASS, Shared, USER, start};
 use lightcraft_cloud::opendrive::{OpenDriveConfig, OpenDriveProvider, login};
 use lightcraft_cloud::{CloudError, Net, ObjectName, Provider, Quota, contract, fetch_blob, store_blob};
+use md5::{Digest, Md5};
 
 fn signed_in(base: &str, folder: &str) -> OpenDriveProvider {
     let mut config = login(Some(base), USER, PASS, &Net::default()).unwrap();
@@ -176,4 +177,69 @@ fn rate_limits_are_waited_out() {
     store_blob(&mut p, b"after the limit").unwrap();
     state.lock().unwrap().rate_limited = 100;
     assert!(matches!(p.quota(), Err(CloudError::Io(_))));
+}
+
+#[test]
+fn the_users_own_folders_can_be_read_but_nothing_else() {
+    use lightcraft_cloud::Browse;
+    let (state, base) = start();
+    let big = bytes(300_000, 9);
+    {
+        let mut s = state.lock().unwrap();
+        s.add_file("Photos A/Iceland 2019/DSC_0001.NEF", &big);
+        s.add_file("Photos A/Iceland 2019/DSC_0001.JPG", b"jpeg");
+        s.add_file("Photos A/Notes.txt", b"n");
+    }
+    let mut b = signed_in(&base, "LightCraft").into_browser();
+    assert!(matches!(b.folder("Photos B"), Err(CloudError::NotFound)));
+    let root = b.folder("/Photos A/").unwrap();
+    let dir = b.list(&root).unwrap();
+    assert_eq!(dir.folders.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(), ["Iceland 2019"]);
+    assert_eq!(dir.files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Notes.txt"]);
+    let trip = b.list(&dir.folders[0].0).unwrap();
+    let nef = trip.files.iter().find(|f| f.name == "DSC_0001.NEF").unwrap().clone();
+    assert_eq!(nef.size, 300_000);
+    let hash: String = Md5::digest(&big).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(b.content_hash(&nef.id).unwrap(), Some(hash));
+    // the start, a middle part, past the end
+    assert_eq!(b.read_range(&nef.id, 0, 1000).unwrap(), &big[..1000]);
+    assert_eq!(b.read_range(&nef.id, 299_990, 1000).unwrap(), &big[299_990..]);
+    assert!(b.read_range(&nef.id, 400_000, 10).unwrap().is_empty());
+    assert!(b.list("../x").is_err() && b.read_range("a/b", 0, 1).is_err(), "ids are checked before they go in a URL");
+    // nothing in the folders changed
+    let s = state.lock().unwrap();
+    assert_eq!(s.files.len(), 3);
+    assert!(s.files.values().any(|f| f.name == "DSC_0001.NEF" && f.data == big));
+}
+
+#[test]
+fn parallel_workers_share_one_rotating_token() {
+    use lightcraft_cloud::Browse;
+    let (state, base) = start();
+    let ids: Vec<String> = {
+        let mut s = state.lock().unwrap();
+        (0..40).map(|i| s.add_file(&format!("Photos/T/IMG_{i}.JPG"), &bytes(5000, i))).collect()
+    };
+    let main = signed_in(&base, "LightCraft").into_browser();
+    let handles: Vec<_> = (0..8)
+        .map(|w| {
+            let mut b = main.worker();
+            let (ids, state) = (ids.clone(), state.clone());
+            std::thread::spawn(move || {
+                for (i, id) in ids.iter().enumerate().filter(|(i, _)| i % 8 == w) {
+                    if i == 20 {
+                        // every access token stops working while the others are mid-flight
+                        state.lock().unwrap().access.clear();
+                    }
+                    assert_eq!(b.read_range(id, 0, 10).unwrap(), &bytes(5000, i as u32)[..10]);
+                    assert!(b.content_hash(id).unwrap().is_some());
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    // one refresh token lineage: the one the browsers hold is the one OpenDrive accepts
+    assert_eq!(main.refresh_token(), state.lock().unwrap().refresh);
 }

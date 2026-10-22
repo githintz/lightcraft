@@ -149,9 +149,32 @@ pub struct SignIn {
     pub taken: AtomicBool,
 }
 
+/// A scan of the user's folders running on worker threads (`cloud.scanFolders`).
+#[derive(Debug, Default)]
+pub struct ScanJob {
+    pub progress: lightcraft_organize::scan::Progress,
+    /// The vault account scanned (`None`: a folder on this computer).
+    pub account: Option<String>,
+    pub roots: Vec<String>,
+    /// Stops requests in flight when the scan is cancelled.
+    pub net_cancel: Arc<AtomicBool>,
+    /// How it ended: `(files, how)` or what went wrong; `None` while it runs.
+    pub result: Mutex<Option<std::result::Result<(usize, lightcraft_organize::scan::Stop), String>>>,
+    /// The account's refresh token after the scan (OpenDrive replaces it on every refresh).
+    pub token: Mutex<Option<String>>,
+}
+
+impl ScanJob {
+    pub fn running(&self) -> bool {
+        lock(&self.result).is_none()
+    }
+}
+
 /// The library's cloud state in this session.
 #[derive(Default)]
 pub struct CloudState {
+    /// A scan of the user's own folders (`cloud.scanFolders`), apart from backups.
+    pub scan: Option<Arc<ScanJob>>,
     /// OpenDrive's API root for sign-ins that don't name one (tests point it at a local fake);
     /// `None`: OpenDrive's own.
     pub opendrive_api: Option<String>,
