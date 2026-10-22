@@ -53,9 +53,11 @@ impl Ctx {
 }
 
 /// Commands the dashboard may run: the drive and cloud storage ones, except those that open
-/// another library.
+/// another library, `drive.upload` (files come through `/api/upload`, never as a path on this
+/// computer) and `drive.wait` (it would hold the one session thread every request goes through).
 pub fn allowed(command: &str) -> bool {
-    (command.starts_with("drive.") || command.starts_with("cloud.")) && !matches!(command, "cloud.restore" | "cloud.finishRestore")
+    (command.starts_with("drive.") || command.starts_with("cloud."))
+        && !matches!(command, "cloud.restore" | "cloud.finishRestore" | "drive.upload" | "drive.wait")
 }
 
 /// Serve until the process is stopped. `backend` is made on the session thread (a headless
@@ -282,7 +284,7 @@ fn handle(stream: TcpStream, ctx: &Ctx) {
 
 fn api(route: &str, req: &Request, body: &mut BufReader<TcpStream>, out: &mut TcpStream, ctx: &Ctx) -> std::io::Result<()> {
     // file downloads are plain navigations (no custom header): never from another site
-    if route.starts_with("file/") && req.method == "GET" {
+    if route.starts_with("file/") && matches!(req.method.as_str(), "GET" | "HEAD") {
         if req.header("sec-fetch-site").is_some_and(|s| !matches!(s, "same-origin" | "none")) {
             return api_error(out, 403, "cross-site request");
         }
@@ -305,7 +307,11 @@ fn api(route: &str, req: &Request, body: &mut BufReader<TcpStream>, out: &mut Tc
             if !allowed(command) {
                 return api_error(out, 403, &format!("{command} isn't available to the dashboard"));
             }
-            let params = v.get("params").cloned().filter(Value::is_object).unwrap_or_else(|| json!({}));
+            let mut params = v.get("params").cloned().filter(Value::is_object).unwrap_or_else(|| json!({}));
+            // `wait` (a backup, a sign-in) would hold the session thread: the dashboard polls instead
+            if let Some(o) = params.as_object_mut() {
+                o.remove("wait");
+            }
             match ctx.call(command, params) {
                 Ok(result) => respond_json(out, 200, &json!({"ok": true, "result": result})),
                 Err(e) => respond_json(out, 200, &json!({"ok": false, "error": e})),
@@ -447,7 +453,8 @@ fn send_download(task: &str, req: &Request, out: &mut TcpStream, ctx: &Ctx) -> s
         ("Accept-Ranges", "bytes".to_string()),
     ];
     let content_type = shown.unwrap_or("application/octet-stream");
-    let range = req.header("range").map(|r| parse_range(r, len));
+    // other units and several ranges are ignored (the whole file), as RFC 9110 allows
+    let range = req.header("range").filter(|r| r.trim().starts_with("bytes=") && !r.contains(',')).map(|r| parse_range(r, len));
     let (code, start, count) = match range {
         None => (200, 0, len),
         Some(Some((a, b))) => {
@@ -564,5 +571,6 @@ mod tests {
         assert_eq!(inline_type("archive.zip"), None);
         assert!(allowed("drive.list") && allowed("cloud.status"));
         assert!(!allowed("cloud.restore") && !allowed("photo.delete") && !allowed("library.import"));
+        assert!(!allowed("drive.upload") && !allowed("drive.wait"), "a local path, a held session thread");
     }
 }

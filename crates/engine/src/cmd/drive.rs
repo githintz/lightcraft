@@ -734,8 +734,12 @@ fn upload(s: &mut Session, p: &Value) -> Result<Value> {
     let m = lock(&s.cloud.drive.manifest).clone();
     let parent = target_folder(&m, str_param(p, "parent"), C)?;
     let fallback = source.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let name =
-        str_param(p, "name").and_then(drive::clean_name).or_else(|| drive::clean_name(&fallback)).ok_or_else(|| bad(C, "the file needs a name"))?;
+    // a name given is the name (one that can't be a name is refused, never swapped for the
+    // file's: a staged upload's file name is the inbox's own)
+    let name = match str_param(p, "name") {
+        Some(n) => drive::clean_name(n).ok_or_else(|| bad(C, format!("\"{n}\" can't be a file name")))?,
+        None => drive::clean_name(&fallback).ok_or_else(|| bad(C, "the file needs a name"))?,
+    };
 
     if !staged && source.is_dir() {
         // a whole folder: its folders are made now, its files queued; a file that can't be (too
