@@ -156,10 +156,62 @@ fn prune_removes_blobs_no_file_refers_to() {
     f.backup(&item("original.2", 1), b"deleted photo", &mut rng).unwrap();
     assert_eq!(blob_count(&a), 3);
     let keep = ["original.1".to_string()].into_iter().collect();
-    assert_eq!(f.trash_except(&keep).unwrap(), 1);
+    assert_eq!(f.trash_except(&keep, |id| id.starts_with("original.")).unwrap(), 1);
     assert_eq!(f.prune().unwrap(), 2);
     assert_eq!(blob_count(&a), 1);
     assert!(f.manifest.get("original.2").is_none());
     let e = f.manifest.get("original.1").unwrap();
     assert_eq!(f.restore(&e).unwrap(), b"second version");
+}
+
+#[test]
+fn a_backup_trashes_only_the_entries_in_its_scope() {
+    let a = shared("gdrive", "a");
+    let mut f = fleet(&[("a", &a)]);
+    let mut rng = TestRandom(5);
+    f.backup(&item("original.1", 1), b"photo", &mut rng).unwrap();
+    let doc = lightcraft_cloud::Entry::file("drive.1", "notes.txt", None, ContentId::of(b"notes"), 5);
+    f.store_file(&doc, 1, b"notes", &mut rng).unwrap();
+    let keep = std::collections::BTreeSet::new();
+    assert_eq!(f.trash_except(&keep, |id| id.starts_with("original.")).unwrap(), 1);
+    assert!(f.manifest.get("original.1").unwrap().trashed);
+    assert!(!f.manifest.get("drive.1").unwrap().trashed, "a file the user stored is not part of the library backup");
+}
+
+#[test]
+fn stored_files_keep_their_folder_and_shared_blobs_outlive_one_owner() {
+    let a = shared("gdrive", "a");
+    let mut f = fleet(&[("a", &a)]);
+    let mut rng = TestRandom(6);
+    let folder = lightcraft_cloud::Entry::folder("drive.f", "Taxes", None);
+    f.manifest.record("laptop", lightcraft_cloud::OpKind::Create { entry: folder }).unwrap();
+    let mut e = lightcraft_cloud::Entry::file("drive.1", "2025.pdf", Some("drive.f"), ContentId::of(b"x"), 0);
+    e.availability = Availability::Archive;
+    assert!(matches!(f.store_file(&e, 1, b"same bytes", &mut rng).unwrap(), Outcome::Stored(_)));
+    let copy = lightcraft_cloud::Entry::file("drive.2", "copy.pdf", None, ContentId::of(b"x"), 0);
+    f.store_file(&copy, 1, b"same bytes", &mut rng).unwrap();
+    let stored = f.manifest.get("drive.1").unwrap();
+    assert_eq!((stored.parent.as_deref(), stored.availability, stored.size), (Some("drive.f"), Availability::Archive, 10));
+    assert_eq!(f.manifest.path("drive.1"), ["Taxes", "2025.pdf"]);
+    assert_eq!(blob_count(&a), 1, "identical content is one blob");
+
+    // deleting one owner keeps the blob the other still uses; deleting both removes it
+    let gone = |e: &lightcraft_cloud::Entry| -> Vec<(String, String, ContentId)> {
+        e.replicas.iter().map(|(acc, key)| (acc.clone(), key.clone(), e.content.clone().unwrap())).collect()
+    };
+    let g1 = gone(&stored);
+    f.manifest.record("laptop", lightcraft_cloud::OpKind::Delete { id: "drive.1".into() }).unwrap();
+    assert!(f.delete_unused(&g1).is_empty());
+    assert_eq!(blob_count(&a), 1);
+    let g2 = gone(&f.manifest.get("drive.2").unwrap());
+    f.manifest.record("laptop", lightcraft_cloud::OpKind::Delete { id: "drive.2".into() }).unwrap();
+    assert!(f.delete_unused(&g2).is_empty());
+    assert_eq!(blob_count(&a), 0);
+
+    // nowhere to put a new file: nothing recorded
+    let full = Shared { kind: "s3", mem: Arc::new(Mutex::new(MemProvider::new("full").with_capacity(10))) };
+    let mut f = fleet(&[("full", &full)]);
+    let big = lightcraft_cloud::Entry::file("drive.3", "big.bin", None, ContentId::of(b"x"), 0);
+    assert!(f.store_file(&big, 1, &[0u8; 100], &mut rng).is_err());
+    assert!(f.manifest.get("drive.3").is_none());
 }

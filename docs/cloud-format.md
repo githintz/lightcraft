@@ -90,8 +90,16 @@ JSON: {"format": "lightcraft-vault", "data_key": "<64 hex>", "accounts": [{"id",
 Manifest entry ids LightCraft uses: `catalog.<file>` (a library file: `catalog.snap`, `catalog.log`, `presets.json`,
 `prefs.json`, `view.json`), `library.info` (`{"format": "lightcraft-library-info", "dir", "device"}`), `cloud.settings`,
 `original.<photo id>` (name: the original's path), `smart.<file>` (a smart preview). Each blob is encrypted (above)
-and named by its plaintext's content id. Snapshots are written as `manifest/snapshot-<clock>.json.enc`; the newest
-two are kept on each account.
+and named by its plaintext's content id. A backup trashes only these entries when their files leave the library.
+Snapshots are written as `manifest/snapshot-<clock>.json.enc`; the newest two are kept on each account.
+
+## Drive entries (*implemented*, [`cloud-drive.md`](cloud-drive.md))
+
+Files and folders the user stores directly have entry ids `drive.<16 hex digits>`, with their own names and parents
+(folders are `kind: folder` entries). Their dates and stars are a JSON object
+`{"items": {"<entry id>": {"added", "modified", "starred", "trashedAt"}}}` (times in milliseconds since 1970), stored as
+the entry `meta.drive` on every account; readers merge it item by item, the later `modified` winning. Placement,
+copies and encryption are as for library entries.
 
 ## Manifest (*implemented*, `crates/cloud/src/manifest.rs`; stored as snapshots by `crates/cloud/src/backup.rs`)
 

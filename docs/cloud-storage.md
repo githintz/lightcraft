@@ -1,8 +1,10 @@
 # Distributed cloud storage (proposal)
 
 **Status:** proposal; phase 1 (core crate `crates/cloud`) done; phase 2 (network providers) done: S3-compatible, WebDAV, Google Drive, OneDrive, Dropbox and OpenDrive; phase 3 (backup and
-restore) done: `cloud.*` commands (CLI, control channel, MCP) and Settings ▸ Cloud. Opt-in; nothing changes for a library
-that doesn't turn it on. The local library stays the source of truth.
+restore) done: `cloud.*` commands (CLI, control channel, MCP) and Settings ▸ Cloud; the drive (any files, in folders, next to the
+backup; `drive.*` commands and the Storage Distributor dashboard via `lightcraft-cli drive`) done, see
+[`cloud-drive.md`](cloud-drive.md). Opt-in; nothing changes for a library that doesn't turn it on. The local library stays
+the source of truth.
 
 LightCraft is local-first: no LightCraft account, no LightCraft server, no telemetry. This proposal keeps all three.
 It lets a library spread its originals, smart previews and catalog over **the user's own storage accounts**, as many as
@@ -88,7 +90,7 @@ What each kind of file asks for by default:
 | **4. Offload originals** | Availability per album / photo; "Free up local space"; an offloaded original is fetched on demand while its smart preview is shown; ties into Missing Photos | Edit and export a photo whose original is only in the cloud |
 | **5. Several devices** | First one writer at a time (a remote lease next to `catalog.lock`: "checked out on MacBook"); later per-op device id + Lamport clock and per-op merge rules | Two machines take turns on one library; later edit at once |
 | **6. Web and tablet** | The web build opens the synced library (browser `fetch` transport; only CORS-friendly providers) | A tablet browses and edits a desktop library |
-| **7. Storage Distributor reads it** | The web app shows LightCraft's blobs in its drive view; optionally runs this crate as wasm | One implementation of the format |
+| **7. Storage Distributor reads it** (done, as the dashboard) | The web app is the drive's dashboard: `lightcraft-cli drive` serves it and runs its requests as `drive.*` commands, so there is one implementation of the format ([`cloud-drive.md`](cloud-drive.md)). Later: run this crate as wasm in the browser | Files stored from the dashboard and the library's backup show in one drive |
 
 ### Google Drive
 
