@@ -15,6 +15,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod alloc_release;
+mod drive_server;
 
 use std::io::{BufReader, Write};
 use std::path::Path;
@@ -50,6 +51,14 @@ USAGE:
         --demo            headless: start with the procedurally generated demo library
         --library DIR     headless: open (or create) a persistent LightCraft library; edits are saved
         --compact         list only the helper tools (every command stays reachable via run_command)
+  lightcraft-cli drive [OPTIONS]
+      Serve the drive dashboard (the Storage Distributor web app) on http://127.0.0.1:8790/: one
+      Google Drive-style view over the library's storage accounts, with the library's own backup
+      in a read-only \"LightCraft Library\" folder (docs/cloud-drive.md). Options:
+        --library DIR     headless: open (or create) a LightCraft library
+        --connect [ADDR]  use the running app instead (`lightcraft --control 7980`)
+        --port N          listen on 127.0.0.1:N (default 8790)
+        --ui DIR          the built dashboard (its dist folder); without it, only the API
   lightcraft-cli render <IN> -o <OUT> [OPTIONS]
       Develop one file and export it (.jpg, .png, .tif, .webp, .avif or .dng by extension) with the
       same encoder as the app's Export dialog. Options:
@@ -139,6 +148,7 @@ fn main() -> ExitCode {
     let r = match args.first().map(String::as_str) {
         Some("run") => run(&args[1..]),
         Some("mcp") => mcp(&args[1..]),
+        Some("drive") => drive(&args[1..]),
         Some("render") => render(&args[1..]),
         Some("snapshot") => snapshot(&args[1..]),
         Some("commands") => commands(&args[1..]),
@@ -490,6 +500,53 @@ fn parse_steps(tokens: &[String]) -> Result<Vec<Step>, String> {
 fn run_step(b: &mut dyn Backend, s: &Step) -> Result<Value, String> {
     let direct = s.id.starts_with("ui.") || s.id.starts_with("engine.") || s.id == "app.quit";
     if direct { b.call(&s.id, s.params.clone()) } else { b.call("engine.execute", json!({"command": s.id, "params": s.params})) }
+}
+
+fn drive(args: &[String]) -> Result<(), String> {
+    let mut connect: Option<String> = None;
+    let mut library: Option<String> = None;
+    let mut port = drive_server::DEFAULT_PORT;
+    let mut ui: Option<std::path::PathBuf> = std::env::var_os("LIGHTCRAFT_DRIVE_UI").map(Into::into);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--connect" => match args.get(i + 1).filter(|a| a.contains(':') && !a.starts_with("--")) {
+                Some(a) => {
+                    connect = Some(a.clone());
+                    i += 1;
+                }
+                None => connect = Some(DEFAULT_ADDR.to_string()),
+            },
+            "--library" => library = Some(take_value(args, &mut i, "--library")?.to_string()),
+            "--port" => port = take_value(args, &mut i, "--port")?.parse().map_err(|_| "--port needs a number 1–65535".to_string())?,
+            "--ui" => ui = Some(take_value(args, &mut i, "--ui")?.into()),
+            a => return Err(format!("unknown option `{a}`")),
+        }
+        i += 1;
+    }
+    if connect.is_some() && library.is_some() {
+        return Err("--library is for headless mode; with --connect the app's open library is used".into());
+    }
+    if connect.is_none() && library.is_none() {
+        return Err("drive: give --library DIR (headless) or --connect (the running app)".into());
+    }
+    drive_server::serve(port, ui, move || -> Result<Box<dyn Backend>, String> {
+        match (connect, library) {
+            (Some(addr), _) => {
+                let r = Remote::connect(&addr).map_err(|e| {
+                    format!("LightCraft is not reachable at {addr} ({e}); start it with `lightcraft --control {}`", connect_port(&addr))
+                })?;
+                Ok(Box::new(r))
+            }
+            (None, Some(dir)) => {
+                let mut h = Headless::default();
+                h.session.open_library(&dir, false).map_err(|e| library_error(&dir, e))?;
+                library_warnings(&mut h.session, "lightcraft-cli drive");
+                Ok(Box::new(h))
+            }
+            (None, None) => Err("no library".into()),
+        }
+    })
 }
 
 fn run(args: &[String]) -> Result<(), String> {

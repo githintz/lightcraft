@@ -158,6 +158,8 @@ pub struct CloudState {
     pub job: Option<Arc<CloudJob>>,
     pub sign_in: Option<Arc<SignIn>>,
     pub quotas: BTreeMap<String, std::result::Result<Quota, String>>,
+    /// Files the user stores directly (`drive.*` commands), sharing the manifest with backups.
+    pub drive: crate::drive::DriveState,
 }
 
 impl std::fmt::Debug for CloudState {
@@ -258,6 +260,27 @@ impl CloudState {
     pub fn lock(&mut self) {
         self.vault = None;
         self.passphrase = None;
+        self.drive = Default::default();
+    }
+
+    /// Fold the drive worker's findings into the session: quotas and rotated credentials.
+    pub fn absorb_drive(&mut self, library: &Path) {
+        let t = self.drive.transfers.clone();
+        let quotas = std::mem::take(&mut *lock(&t.quotas));
+        self.quotas.extend(quotas);
+        let updated = std::mem::take(&mut *lock(&t.updated));
+        if let Some(v) = self.vault.as_mut()
+            && !updated.is_empty()
+        {
+            for u in updated {
+                if let Some(a) = v.accounts.iter_mut().find(|a| a.id == u.id) {
+                    *a = u;
+                }
+            }
+            if let Err(e) = self.save_vault(library) {
+                log::warn!("cloud: {e}");
+            }
+        }
     }
 
     pub fn change_passphrase(&mut self, library: &Path, old: &str, new: &str) -> Result<(), String> {
@@ -316,6 +339,8 @@ pub struct BackupPlan {
     pub passphrase: String,
     pub settings: CloudSettings,
     pub library: PathBuf,
+    /// The session's manifest (drive changes made while the backup runs are merged, not lost).
+    pub shared: Arc<Mutex<Manifest>>,
 }
 
 fn open_fleet(vault: &Vault, settings: &CloudSettings, job: &CloudJob, manifest: Manifest) -> Fleet {
@@ -331,7 +356,7 @@ fn open_fleet(vault: &Vault, settings: &CloudSettings, job: &CloudJob, manifest:
     Fleet::new(list, vault.data_key.clone(), settings.device.clone(), manifest)
 }
 
-fn read_local_manifest(library: &Path, vault: &Vault) -> Option<Manifest> {
+pub(crate) fn read_local_manifest(library: &Path, vault: &Vault) -> Option<Manifest> {
     let data = std::fs::read(dir(library).join(MANIFEST_FILE)).ok()?;
     let plain = crypto::decrypt(&vault.data_key, &data, backup::MAX_MANIFEST as u64).ok()?;
     Manifest::from_snapshot(&plain, backup::MAX_MANIFEST).ok()
@@ -380,17 +405,12 @@ pub fn run_backup(mut plan: BackupPlan, job: &CloudJob) -> Result<(), String> {
         return Err("no storage account could be opened".into());
     }
     let remote = fleet.load_manifest().ok();
-    fleet.manifest = match (local, remote) {
-        (Some(l), Some(r)) => {
-            if r.clock() > l.clock() {
-                r
-            } else {
-                l
-            }
-        }
-        (Some(m), None) | (None, Some(m)) => m,
-        (None, None) => Manifest::new(),
-    };
+    // the manifest is merged from every copy: ops from another device or the drive all count
+    let mut manifest = lock(&plan.shared).clone();
+    for m in [local, remote].into_iter().flatten() {
+        manifest.merge(&m).map_err(|e| e.to_string())?;
+    }
+    fleet.manifest = manifest;
     record_quotas(&mut fleet, job);
 
     // each account says which vault account it is (restore uses it)
@@ -440,7 +460,13 @@ pub fn run_backup(mut plan: BackupPlan, job: &CloudJob) -> Result<(), String> {
     }
     // photos no longer in the library: their entries are trashed (blobs stay until a prune)
     if !cancelled {
-        fleet.trash_except(&keep).map_err(|e| e.to_string())?;
+        fleet.trash_except(&keep, crate::drive::is_library_entry).map_err(|e| e.to_string())?;
+    }
+    // drive changes made meanwhile join in, and the session sees what the backup stored
+    {
+        let mut shared = lock(&plan.shared);
+        shared.merge(&fleet.manifest).map_err(|e| e.to_string())?;
+        fleet.manifest = shared.clone();
     }
 
     let errors = fleet.save_manifest(&mut rng).map_err(|e| format!("couldn't save the manifest to any account: {e}"))?;

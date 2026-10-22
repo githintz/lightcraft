@@ -17,9 +17,11 @@ format: `docs/cloud-format.md`.
   providers on `lightcraft-fetch`'s pure-Rust HTTPS client, native only. `oauth`: sign-in with PKCE and a loopback
   redirect (RFC 7636, RFC 8252), no server, and `TokenSource` (access tokens from a refresh token);
   `examples/cloud-signin.rs` prints a refresh token. Live tests: `docs/cloud-storage.md` → Testing.
-- `backup`: a `Fleet` of accounts: back up (placement, encrypted blobs, skip what is stored), save and load the
-  manifest on every account, restore with fallback to another copy, prune; `accounts::open` turns a vault entry into a
-  provider. The engine's `cloud.*` commands use them (`crates/engine/src/cmd/cloud.rs`).
+- `backup`: a `Fleet` of accounts: back up (placement, encrypted blobs, skip what is stored), store a file into a
+  folder (`store_file`, the drive), delete copies no entry uses any more (`delete_unused`), save and load the manifest
+  on every account, restore with fallback to another copy, prune; `accounts::open` turns a vault entry into a
+  provider. The engine's `cloud.*` and `drive.*` commands use them (`crates/engine/src/cmd/cloud.rs`, `cmd/drive.rs`).
+  `Manifest::merge` folds one copy of the manifest into another (as if both copies' ops were applied).
 - `contract::check_provider`: the checks every provider passes (`tests/providers.rs`; Google Drive, OneDrive and
   Dropbox against fake servers in `tests/gdrive.rs`, `tests/onedrive.rs`, `tests/dropbox.rs`).
 

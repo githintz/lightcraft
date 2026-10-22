@@ -157,6 +157,13 @@ impl<T: Ord> Lww<T> {
             self.value = value;
         }
     }
+
+    fn merge(&mut self, other: &Lww<T>)
+    where
+        T: Clone,
+    {
+        self.set(&other.at, other.value.clone());
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +199,24 @@ impl Record {
             trashed: self.trashed.value,
             replicas: self.replicas.iter().filter_map(|(a, r)| r.value.clone().map(|k| (a.clone(), k))).collect(),
         }
+    }
+
+    /// Every field takes the later of its two values, as if both records' ops had been applied.
+    fn merge(&mut self, other: &Record) -> Result<()> {
+        self.exists.merge(&other.exists);
+        self.kind.merge(&other.kind);
+        self.name.merge(&other.name);
+        self.parent.merge(&other.parent);
+        self.content.merge(&other.content);
+        self.availability.merge(&other.availability);
+        self.trashed.merge(&other.trashed);
+        for (account, r) in &other.replicas {
+            if !self.replicas.contains_key(account) && self.replicas.len() >= MAX_REPLICAS {
+                return Err(CloudError::Corrupt(format!("more than {MAX_REPLICAS} replicas")));
+            }
+            self.replicas.entry(account.clone()).or_default().merge(r);
+        }
+        Ok(())
     }
 
     fn set_replica(&mut self, at: &Stamp, account: &str, key: Option<String>) -> Result<()> {
@@ -343,6 +368,16 @@ impl Manifest {
         let op = Op { stamp: self.next_stamp(device), kind };
         self.apply(&op)?;
         Ok(op)
+    }
+
+    /// Fold in another copy of the manifest (another device's, or one a worker thread changed):
+    /// the result is what applying both copies' ops would give, in any order.
+    pub fn merge(&mut self, other: &Manifest) -> Result<()> {
+        self.clock = self.clock.max(other.clock);
+        for (id, r) in &other.records {
+            self.records.entry(id.clone()).or_default().merge(r)?;
+        }
+        Ok(())
     }
 
     pub fn get(&self, id: &str) -> Option<Entry> {
@@ -522,6 +557,28 @@ mod tests {
         assert!(forward.get("p2").is_none(), "deleted");
         assert_eq!(forward.path("p1"), ["Trips", "Dunes.CR3"]);
         assert_eq!(forward.clock(), 8);
+    }
+
+    #[test]
+    fn merging_copies_equals_applying_all_ops() {
+        let ops = sample_ops();
+        let all = apply_all(&ops);
+        // two devices each saw part of the ops (with overlap)
+        let a = apply_all(&ops[..7]);
+        let b = apply_all(&ops[4..]);
+        let mut ab = a.clone();
+        ab.merge(&b).unwrap();
+        let mut ba = b.clone();
+        ba.merge(&a).unwrap();
+        assert_eq!(ab, all);
+        assert_eq!(ba, all);
+        // merging again changes nothing
+        ab.merge(&a).unwrap();
+        ab.merge(&all).unwrap();
+        assert_eq!(ab, all);
+        // ops recorded after a merge get later stamps than both copies
+        let s = ab.next_stamp("mac");
+        assert!(s.lamport > a.clock() && s.lamport > b.clock());
     }
 
     #[test]

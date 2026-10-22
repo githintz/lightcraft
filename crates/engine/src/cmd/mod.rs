@@ -14,6 +14,8 @@ mod cull;
 pub mod curves;
 pub(crate) mod denoise;
 mod develop;
+#[cfg(not(target_arch = "wasm32"))]
+mod drive;
 mod edit;
 mod export;
 pub(crate) mod face_detect;
@@ -158,6 +160,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(face_recognize::specs());
         #[cfg(not(target_arch = "wasm32"))]
         v.extend(cloud::specs());
+        #[cfg(not(target_arch = "wasm32"))]
+        v.extend(drive::specs());
         v
     })
 }

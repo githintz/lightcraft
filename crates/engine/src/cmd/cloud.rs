@@ -406,7 +406,9 @@ fn backup(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(C, "no storage account: add one first (cloud.addAccount or cloud.signIn)"));
     }
     let items = plan_items(s, &dir, C)?;
-    let plan = BackupPlan { items, vault, passphrase: pass, settings: s.cloud.settings.clone(), library: dir.clone() };
+    s.cloud.drive.load(&dir, &vault);
+    let shared = s.cloud.drive.manifest.clone();
+    let plan = BackupPlan { items, vault, passphrase: pass, settings: s.cloud.settings.clone(), library: dir.clone(), shared };
     let job = Arc::new(CloudJob::new("backup"));
     s.cloud.job = Some(job.clone());
     if super::bool_or(p, "wait", false) {

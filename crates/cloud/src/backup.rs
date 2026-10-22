@@ -275,14 +275,52 @@ impl Fleet {
         }
     }
 
-    /// Mark entries not in `keep` as trashed (their files are gone from the library). Their blobs
-    /// stay until [`Fleet::prune`].
-    pub fn trash_except(&mut self, keep: &std::collections::BTreeSet<String>) -> Result<usize> {
-        let gone: Vec<String> = self.manifest.entries().filter(|e| !e.trashed && !keep.contains(&e.id)).map(|e| e.id).collect();
+    /// Mark the entries `scope` accepts that are not in `keep` as trashed (their files are gone
+    /// from the library); entries outside `scope` (files the user stored directly) are left
+    /// alone. Their blobs stay until [`Fleet::prune`].
+    pub fn trash_except(&mut self, keep: &std::collections::BTreeSet<String>, scope: impl Fn(&str) -> bool) -> Result<usize> {
+        let gone: Vec<String> = self.manifest.entries().filter(|e| !e.trashed && scope(&e.id) && !keep.contains(&e.id)).map(|e| e.id).collect();
         for id in &gone {
             self.record(OpKind::SetTrashed { id: id.clone(), trashed: true })?;
         }
         Ok(gone.len())
+    }
+
+    /// Store `data` as the file `entry` (its id, name, folder and availability; content and size
+    /// come from `data`), placed like [`Fleet::backup`] with `copies` copies. A new entry is
+    /// recorded only when an account took the file.
+    pub fn store_file(&mut self, entry: &Entry, copies: u8, data: &[u8], rng: &mut dyn Random) -> Result<Outcome> {
+        let existed = self.manifest.get(&entry.id).is_some();
+        if !existed {
+            let mut e = Entry::file(&entry.id, &entry.name, entry.parent.as_deref(), ContentId::of(data), data.len() as u64);
+            e.availability = entry.availability;
+            self.record(OpKind::Create { entry: e })?;
+        }
+        let item = Item { id: entry.id.clone(), name: entry.name.clone(), level: entry.availability, copies, everywhere: false };
+        let r = self.backup(&item, data, rng);
+        if r.is_err() && !existed {
+            self.record(OpKind::Delete { id: entry.id.clone() })?;
+        }
+        r
+    }
+
+    /// Delete the stored copies `gone` (account id, provider key, content) of entries that were
+    /// deleted, except where an entry (even a trashed one) still holds the same content on that
+    /// account: identical files share one blob. The copies that couldn't be deleted, with why.
+    pub fn delete_unused(&mut self, gone: &[(String, String, ContentId)]) -> Vec<(String, CloudError)> {
+        let used: std::collections::BTreeSet<(String, ContentId)> =
+            self.manifest.entries().filter_map(|e| e.content.map(|c| e.replicas.into_keys().map(move |a| (a, c.clone())))).flatten().collect();
+        let mut errors = Vec::new();
+        for (account, key, content) in gone {
+            if used.contains(&(account.clone(), content.clone())) {
+                continue;
+            }
+            let Some(a) = self.account_mut(account) else { continue };
+            if let Err(e) = a.provider.delete(&RemoteRef { key: key.clone() }) {
+                errors.push((account.clone(), e));
+            }
+        }
+        errors
     }
 
     /// Write the manifest to every account (encrypted) and remove older snapshots; the accounts

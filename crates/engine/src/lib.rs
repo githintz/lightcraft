@@ -28,6 +28,8 @@ pub mod demo;
 pub mod denoise;
 pub mod devices;
 pub mod display;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod drive;
 pub mod export;
 pub mod face_download;
 #[cfg(not(target_arch = "wasm32"))]
@@ -874,6 +876,8 @@ mod tests_cloud;
 mod tests_color;
 #[cfg(test)]
 mod tests_denoise;
+#[cfg(test)]
+mod tests_drive;
 #[cfg(test)]
 mod tests_export;
 #[cfg(test)]
