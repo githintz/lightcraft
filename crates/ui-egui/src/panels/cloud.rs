@@ -35,7 +35,10 @@ fn form_id() -> egui::Id {
 
 fn gb(bytes: u64) -> String {
     let g = bytes as f64 / 1_073_741_824.0;
-    if g >= 100.0 {
+    if g >= 1024.0 {
+        let t = g / 1024.0;
+        if t.fract() < 0.05 { format!("{t:.0} TB") } else { format!("{t:.1} TB") }
+    } else if g >= 100.0 {
         format!("{g:.0} GB")
     } else if g >= 1.0 {
         format!("{g:.1} GB")
