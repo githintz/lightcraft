@@ -91,7 +91,13 @@ Manifest entry ids LightCraft uses: `catalog.<file>` (a library file: `catalog.s
 `prefs.json`, `view.json`), `library.info` (`{"format": "lightcraft-library-info", "dir", "device"}`), `cloud.settings`,
 `original.<photo id>` (name: the original's path), `smart.<file>` (a smart preview). Each blob is encrypted (above)
 and named by its plaintext's content id. A backup trashes only these entries when their files leave the library.
-Snapshots are written as `manifest/snapshot-<clock>.json.enc`; the newest two are kept on each account.
+Snapshots are written as `manifest/snapshot-<clock>-<device>.json.enc` (`<device>`: the writing computer's id, letters,
+digits and `-`; older ones have no device part). Reading the manifest merges the newest eight snapshots (several
+computers may each have saved one since the last read). A computer keeps its own newest two and deletes another
+computer's snapshot only after it has merged it into one it saved, so a change saved elsewhere is never dropped.
+`account.json` on each account is `{"format": "lightcraft-cloud-account", "id", "accounts": {<id>: <account
+settings>}}`: which vault account it is, and every account's size limit, speed, preference and pause, for a computer
+that joins the drive.
 
 ## Drive entries (*implemented*, [`cloud-drive.md`](cloud-drive.md))
 

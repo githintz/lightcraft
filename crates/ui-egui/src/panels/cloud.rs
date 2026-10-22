@@ -328,7 +328,11 @@ fn backup(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, ctx: &egui::Co
             run(app, ctx, "cloud.configure", json!({"originalCopies": v}));
         }
     });
-    hint(ui, t, "Copies go to accounts at different providers, so one provider closing an account loses nothing. The catalog goes to every account.");
+    hint(
+        ui,
+        t,
+        "Copies go to different accounts, at different providers first, so one provider closing an account loses nothing. The catalog goes to every account.",
+    );
     let mut smart = status["smartPreviews"].as_bool().unwrap_or(true);
     if check(ui, "cloud.smartPreviews", &mut smart, "Include smart previews (edit photos whose original is offline)") {
         run(app, ctx, "cloud.configure", json!({"smartPreviews": smart}));

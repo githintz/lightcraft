@@ -1,12 +1,12 @@
 # The drive: one Google Drive-style view over your storage accounts
 
 **Status:** works with the accounts cloud backup supports (folders, S3-compatible, WebDAV, Google Drive, OneDrive,
-Dropbox). Opt-in; nothing changes for a library that doesn't use it. Design of the storage underneath:
+Dropbox, OpenDrive). Opt-in; nothing changes for a library that doesn't use it. Design of the storage underneath:
 [`cloud-storage.md`](cloud-storage.md); on-storage format: [`cloud-format.md`](cloud-format.md).
 
 Cloud backup spreads a library over the user's own accounts. The drive puts the same machinery behind a plain file
 manager: the user drops any files in, organises them in folders, and gets them back, without seeing which account holds
-what. Placement (free space, caps, speed, priority), copies on different providers, end-to-end encryption and the
+what. Placement (free space, caps, speed, priority), copies on different accounts, end-to-end encryption and the
 manifest on every account all work as they do for backups. The library's own backup appears next to the user's files
 as a read-only **LightCraft Library** folder (Originals by folder, Smart previews, Catalog), so everything stored is in
 one place.
@@ -58,11 +58,34 @@ drive.wait        {timeoutMs?}               block until queued transfers are st
   version), downloads (decrypted into `cloud/outbox/`, kept an hour), deleting stored copies, and reading the accounts'
   manifest. Changes to names, folders, stars and the trash are saved in the library at once and on the accounts when
   the worker's queue is empty (`drive.transfers` → `unsynced`).
-- **Upload speed** (`level`: instant … archive) and **copies** (1–8, on different providers) are per upload; the
-  dashboard's Settings pick its defaults.
+- **Upload speed** (`level`: instant … archive) and **copies** (1–8) are per upload; the dashboard's Settings pick its
+  defaults. Copies go to different accounts, one per provider first; when there are fewer providers than copies, the
+  rest go to other accounts of the same provider (two disks are two places even if both are folders). Content already
+  stored for another item (the same file uploaded twice, a photo the library backup holds) is shared, not sent again.
+- **Uploads that can't be stored** fail with the reason (no account accepts files, no room under the size limits, an
+  account that can't be reached); a folder upload reports the files it skipped (links, special files, files over the
+  size limit) and queues the rest. A name that can't be a file name (`..`, only spaces) is refused.
 - **Scripts:** transfers run on a worker thread, so a `lightcraft-cli run` that uploads ends with `drive.wait` (or passes
   `wait=true` to `drive.upload`); otherwise the process can exit with uploads still queued (nothing is half-stored:
   an entry is recorded only once its file is on an account).
+
+## The vault on the accounts, and more than one computer
+
+Like a backup, the drive puts the sealed vault (`vault.enc`, the data key behind the passphrase) and each account's
+`account.json` on every account, so the drive opens from any one account and the passphrase. `account.json` also
+carries every account's settings (size limit, speed, preference, paused).
+
+- **Another computer** opens the same drive with `cloud.join {provider, config, passphrase}` (the dashboard's **Use
+  that drive here** on its first screen): one account's folder or sign-in and the passphrase. It takes the vault and the
+  accounts' settings from that account, then lists and changes the same drive. Each computer saves its own manifest
+  snapshot (`snapshot-<clock>-<device>.json.enc`); reading the accounts merges the newest few, and a computer deletes
+  another's snapshot only once it has merged it, so changes made on both survive. `drive.sync` reads the accounts again.
+- **A joined library doesn't back up there:** the accounts already hold the other library's backup, and a backup of this
+  library would mark those photos as removed. Back a joined library up to other accounts.
+- **Storage that already holds another drive or backup** (a vault the passphrase doesn't open) can't be added as an
+  account; a folder can't be added twice, inside or around another account's folder, or inside the library.
+- **OpenDrive** replaces its sign-in token on every refresh, and the old one stops working; every user of one account
+  in a process (the drive's worker, a backup) refreshes through one shared token source, and the vault keeps the newest.
 
 ## How it shares the storage with backups
 
@@ -82,9 +105,9 @@ thread (64 at most).
 
 | Request | Does |
 |---|---|
-| `POST /api/call {command, params}` | runs a `drive.*` or `cloud.*` command (not `cloud.restore` / `cloud.finishRestore`) → `{ok, result \| error}` |
+| `POST /api/call {command, params}` | runs a `drive.*` or `cloud.*` command → `{ok, result \| error}`; not `cloud.restore` / `cloud.finishRestore` (another library), `drive.upload` (a path on this computer: files come through `/api/upload`) or `drive.wait`, and `wait` params are dropped (they would hold the one session thread) |
 | `PUT /api/upload?name=&parent=&level=&copies=` (body: the file) | writes it to `cloud/inbox/`, then `drive.upload {staged: true}`, which removes it once stored |
-| `GET /api/file/<task>[?inline=1]` | a finished download (Range requests for video); shown inline only for images, PDF, audio, video and plain text, always under `Content-Security-Policy: sandbox` |
+| `GET` / `HEAD /api/file/<task>[?inline=1]` | a finished download (one `bytes=` Range for video; other units or several ranges get the whole file); shown inline only for images, PDF, audio, video and plain text, always under `Content-Security-Policy: sandbox` (a PDF under `default-src 'none'`) |
 | `GET /api/health` | `{ok, app, version}` |
 | anything else | the dashboard's files from `--ui` (unknown routes get `index.html`) |
 
@@ -96,10 +119,13 @@ The passphrase crosses only the loopback connection.
 
 ## Testing
 
-`cargo test -p lightcraft-engine tests_drive` (folders, uploads, unique names, moves, stars, the trash, deleting stored
-copies, downloads, the library folder next to drive files, a backup not trashing them, the drive read back from the
-accounts alone) and `cargo test -p lightcraft-cli --test drive` (the HTTP API against a real server process, including
-the requests it must refuse).
+The scenarios and edge cases, with the test that covers each, are listed in [`cloud-test-plan.md`](cloud-test-plan.md).
+`cargo test -p lightcraft-engine tests_drive` (the commands: folders, uploads, unique names, moves, stars, the trash,
+deleting stored copies, downloads, the library folder, two computers, joined libraries, damaged files), `cargo test -p
+lightcraft-engine tests_cloud` (backups, OpenDrive with the drive at once), `cargo test -p lightcraft-cli --test drive
+--test drive_http` (the HTTP API against a real server process: what it must refuse, malformed requests, uploads,
+ranges, static files, many connections). The dashboard's own end-to-end tests (`npm run e2e` in Storage Distributor)
+drive it in Chromium against a real `lightcraft-cli drive`.
 
 ## Next
 

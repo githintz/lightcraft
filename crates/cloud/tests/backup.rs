@@ -215,3 +215,33 @@ fn stored_files_keep_their_folder_and_shared_blobs_outlive_one_owner() {
     assert!(f.store_file(&big, 1, &[0u8; 100], &mut rng).is_err());
     assert!(f.manifest.get("drive.3").is_none());
 }
+
+#[test]
+fn a_shared_copy_deleted_meanwhile_is_stored_again() {
+    let a = shared("folder", "a");
+    let mut drive = fleet(&[("a", &a)]);
+    let mut rng = TestRandom(3);
+    let photo = vec![5u8; 20_000];
+    // the drive holds these bytes; a backup working on its own copy of the manifest shares them
+    drive.backup(&item("drive.1", 1), &photo, &mut rng).unwrap();
+    let mut backup = fleet(&[("a", &a)]);
+    backup.manifest = drive.manifest.clone();
+    assert_eq!(backup.backup(&item("original.1", 1), &photo, &mut rng).unwrap(), Outcome::Stored(vec!["a".into()]));
+    assert_eq!(blob_count(&a), 1, "shared, not sent again");
+    // meanwhile the drive file is deleted forever and its copy with it
+    let gone = drive.manifest.get("drive.1").unwrap();
+    let key = gone.replicas["a"].clone();
+    drive.manifest.record("laptop", lightcraft_cloud::OpKind::Delete { id: "drive.1".into() }).unwrap();
+    assert!(drive.delete_unused(&[("a".into(), key, gone.content.unwrap())]).is_empty());
+    assert_eq!(blob_count(&a), 0);
+    // the backup notices before saving: the photo has no copy, and the next backup stores it
+    assert_eq!(backup.check_reused().unwrap(), 1);
+    assert!(backup.manifest.get("original.1").unwrap().replicas.is_empty());
+    // (a backup merges the drive's changes before it saves)
+    backup.manifest.merge(&drive.manifest).unwrap();
+    assert_eq!(backup.backup(&item("original.1", 1), &photo, &mut rng).unwrap(), Outcome::Stored(vec!["a".into()]));
+    assert_eq!(blob_count(&a), 1);
+    assert_eq!(backup.restore(&backup.manifest.get("original.1").unwrap()).unwrap(), photo);
+    // nothing to check twice
+    assert_eq!(backup.check_reused().unwrap(), 0);
+}

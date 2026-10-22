@@ -66,7 +66,7 @@ the browser's `fetch` as transport there).
 Port of the Storage Distributor engine (`crates/cloud/src/placement.rs`, with its tests). An account qualifies when it
 accepts uploads, has room, allows the file's size and is at least the level's minimum speed. Qualifying accounts are
 ranked by free share left, fit to the level's ideal speed, reliability, user priority, minus a penalty for being faster
-than needed (keeps fast space for files that need it). Copies go to different providers. Free space is the smaller of
+than needed (keeps fast space for files that need it). Copies go to different accounts: one per provider first, then other accounts of the same provider when there are fewer providers than copies. Free space is the smaller of
 the provider's quota left and the user's cap minus what the library stored (90 % of the quota when no cap is set; an
 account of unknown size gets nothing until the user sets a cap).
 

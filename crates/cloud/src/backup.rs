@@ -77,7 +77,7 @@ pub struct Item {
     /// What it is to the library (an original's path, a catalog file's name).
     pub name: String,
     pub level: Availability,
-    /// Copies on different providers (ignored when `everywhere`).
+    /// Copies on different accounts, different providers first (ignored when `everywhere`).
     pub copies: u8,
     /// On every account that accepts uploads (the catalog: losing an account never loses it).
     pub everywhere: bool,
@@ -102,6 +102,9 @@ pub struct Fleet {
     /// The snapshots [`Fleet::load_manifest`] merged (other devices' ones may be removed once a
     /// snapshot holding them is saved).
     merged: std::collections::BTreeSet<String>,
+    /// `(entry, account, key)` of the copies [`Fleet::backup`] shared with another entry instead
+    /// of uploading ([`Fleet::check_reused`] makes sure they are still there).
+    reused: Vec<(String, String, String)>,
 }
 
 /// Most snapshots [`Fleet::load_manifest`] reads and merges (the newest).
@@ -134,7 +137,7 @@ fn max_cipher(plain: u64) -> u64 {
 
 impl Fleet {
     pub fn new(accounts: Vec<Account>, data_key: Key, device: impl Into<String>, manifest: Manifest) -> Fleet {
-        Fleet { accounts, data_key, device: device.into(), manifest, weights: Weights::default(), merged: Default::default() }
+        Fleet { accounts, data_key, device: device.into(), manifest, weights: Weights::default(), merged: Default::default(), reused: Vec::new() }
     }
 
     fn account_mut(&mut self, id: &str) -> Option<&mut Account> {
@@ -291,6 +294,7 @@ impl Fleet {
         }
         for (account, key) in &reuse {
             self.record(OpKind::AddReplica { id: item.id.clone(), account: account.clone(), key: key.clone() })?;
+            self.reused.push((item.id.clone(), account.clone(), key.clone()));
         }
 
         let mut stored = reused;
@@ -331,6 +335,28 @@ impl Fleet {
             }
         }
         out
+    }
+
+    /// Drop the shared copies [`Fleet::backup`] counted on that are no longer on their account
+    /// (another worker deleted the item that held them meanwhile), so the next backup stores the
+    /// file again; how many. An account that can't be listed is left as it is.
+    pub fn check_reused(&mut self) -> Result<usize> {
+        let reused = std::mem::take(&mut self.reused);
+        let mut listed: BTreeMap<String, Option<std::collections::BTreeSet<String>>> = BTreeMap::new();
+        let mut dropped = 0;
+        for (id, account, key) in reused {
+            if !listed.contains_key(&account) {
+                let keys = self.account_mut(&account).and_then(|a| a.provider.list().ok()).map(|l| l.into_iter().map(|l| l.remote.key).collect());
+                listed.insert(account.clone(), keys);
+            }
+            let there = listed.get(&account).and_then(Option::as_ref).is_none_or(|keys| keys.contains(&key));
+            let still_used = self.manifest.get(&id).is_some_and(|e| e.replicas.get(&account) == Some(&key));
+            if !there && still_used {
+                self.record(OpKind::RemoveReplica { id, account })?;
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
     }
 
     /// Mark the entries `scope` accepts that are not in `keep` as trashed (their files are gone

@@ -54,7 +54,7 @@ pub struct CloudSettings {
     /// This device's id in manifest stamps.
     pub device: String,
     pub accounts: BTreeMap<String, AccountSettings>,
-    /// Copies of each original, on different providers when there are enough.
+    /// Copies of each original, on different accounts (different providers first).
     pub original_copies: u8,
     pub smart_previews: bool,
     /// OAuth client ids by provider (`gdrive`, `onedrive`, `dropbox`), to prefill sign-in.
@@ -561,6 +561,11 @@ pub fn run_backup(mut plan: BackupPlan, job: &CloudJob) -> Result<(), String> {
     // photos no longer in the library: their entries are trashed (blobs stay until a prune)
     if !cancelled {
         fleet.trash_except(&keep, crate::drive::is_library_entry).map_err(|e| e.to_string())?;
+    }
+    // a copy shared with a drive file that was deleted forever meanwhile may be gone with it:
+    // dropped from the manifest, so the next backup stores the photo again
+    if let Err(e) = fleet.check_reused() {
+        log::warn!("cloud: checking shared copies: {e}");
     }
     // drive changes made meanwhile join in, and the session sees what the backup stored
     {
