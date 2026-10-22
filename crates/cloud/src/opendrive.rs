@@ -187,12 +187,32 @@ fn uploaded_offset(body: &[u8]) -> Option<u64> {
     rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
 }
 
+/// Every OpenDrive sign-in this process uses, with its API root. OpenDrive replaces the refresh
+/// token on every refresh and the old one stops working, so two providers opened from the same
+/// sign-in (the drive's worker and a backup, a vault saved before a rotation) must refresh through
+/// one source, or the first refresh signs the other out.
+static SOURCES: Mutex<Vec<(String, Arc<Mutex<TokenSource>>)>> = Mutex::new(Vec::new());
+const MAX_SOURCES: usize = 64;
+
+/// The source for `refresh` (the current token of a sign-in in use, or one it replaced), or a new one.
+fn shared_source(api: &str, client: OAuthClient, refresh: &str) -> Arc<Mutex<TokenSource>> {
+    let mut all = SOURCES.lock().unwrap_or_else(PoisonError::into_inner);
+    let api = api.trim_end_matches('/');
+    if let Some((_, t)) = all.iter().find(|(a, t)| a == api && t.lock().unwrap_or_else(PoisonError::into_inner).knows(refresh)) {
+        return t.clone();
+    }
+    if all.len() >= MAX_SOURCES {
+        all.remove(0);
+    }
+    let t = Arc::new(Mutex::new(TokenSource::new(client, refresh)));
+    all.push((api.to_string(), t.clone()));
+    t
+}
+
 pub struct OpenDriveProvider {
-    /// Shared by the clones of an [`OpenDriveBrowser`]: OpenDrive replaces the refresh token on
-    /// every refresh, so parallel workers must refresh through one source.
+    /// Shared by every provider on this sign-in ([`SOURCES`]): OpenDrive replaces the refresh
+    /// token on every refresh, so parallel workers must refresh through one source.
     tokens: Arc<Mutex<TokenSource>>,
-    /// The refresh token as of the last request (for [`Provider::refresh_token`]).
-    refresh: String,
     api: Url,
     folder: String,
     label: String,
@@ -213,8 +233,7 @@ impl OpenDriveProvider {
         }
         let client = OAuthClient::opendrive(token_url(&config.api));
         Ok(OpenDriveProvider {
-            refresh: config.refresh_token.clone(),
-            tokens: Arc::new(Mutex::new(TokenSource::new(client, config.refresh_token))),
+            tokens: shared_source(&config.api, client, &config.refresh_token),
             api,
             folder: config.folder,
             label: label.into(),
@@ -234,9 +253,9 @@ impl OpenDriveProvider {
         Ok(self)
     }
 
-    /// The refresh token in use.
-    pub fn refresh_token(&self) -> &str {
-        &self.refresh
+    /// The refresh token in use (by any provider on this sign-in).
+    pub fn refresh_token(&self) -> String {
+        self.tokens.lock().unwrap_or_else(PoisonError::into_inner).refresh_token().to_string()
     }
 
     /// The app folder, made (private) when missing.
@@ -252,12 +271,7 @@ impl OpenDriveProvider {
         let mut refreshed = false;
         let mut attempt = 0u32;
         loop {
-            let token = {
-                let mut t = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
-                let token = t.bearer(&self.net)?;
-                t.refresh_token().clone_into(&mut self.refresh);
-                token
-            };
+            let token = { self.tokens.lock().unwrap_or_else(PoisonError::into_inner).bearer(&self.net)? };
             let mut q: Vec<(&str, &str)> = query.to_vec();
             q.push(("access_token", token.as_str()));
             let url = Url { path: format!("{}{route}?{}", self.api.path.trim_end_matches('/'), form(&q)), ..self.api.clone() };
@@ -556,7 +570,7 @@ impl OpenDriveProvider {
 impl OpenDriveBrowser {
     /// The refresh token in use (OpenDrive replaces it on every refresh: the vault must keep it).
     pub fn refresh_token(&self) -> String {
-        self.0.tokens.lock().unwrap_or_else(PoisonError::into_inner).refresh_token().to_string()
+        self.0.refresh_token()
     }
 
     /// Another browser on the same account for a parallel worker: its own connection settings,
@@ -565,7 +579,6 @@ impl OpenDriveBrowser {
         let p = &self.0;
         OpenDriveBrowser(OpenDriveProvider {
             tokens: p.tokens.clone(),
-            refresh: p.refresh.clone(),
             api: p.api.clone(),
             folder: p.folder.clone(),
             label: p.label.clone(),
@@ -676,8 +689,9 @@ fn multipart(data: &[u8]) -> Body {
 }
 
 impl Provider for OpenDriveProvider {
-    fn refresh_token(&self) -> Option<&str> {
-        Some(&self.refresh)
+    fn refresh_token(&self) -> Option<String> {
+        // the shared source's: another provider on this sign-in may have rotated it since
+        Some(OpenDriveProvider::refresh_token(self))
     }
 
     fn info(&self) -> ProviderInfo {

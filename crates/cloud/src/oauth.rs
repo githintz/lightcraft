@@ -144,8 +144,12 @@ impl std::fmt::Debug for Tokens {
 pub struct TokenSource {
     client: OAuthClient,
     refresh_token: String,
+    /// The refresh tokens this one replaced, newest last (at most [`EARLIER_TOKENS`]).
+    earlier: Vec<String>,
     access: Option<(String, Instant)>,
 }
+
+const EARLIER_TOKENS: usize = 32;
 
 impl std::fmt::Debug for TokenSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -155,7 +159,7 @@ impl std::fmt::Debug for TokenSource {
 
 impl TokenSource {
     pub fn new(client: OAuthClient, refresh_token: impl Into<String>) -> TokenSource {
-        TokenSource { client, refresh_token: refresh_token.into(), access: None }
+        TokenSource { client, refresh_token: refresh_token.into(), earlier: Vec::new(), access: None }
     }
 
     pub fn client(&self) -> &OAuthClient {
@@ -166,6 +170,12 @@ impl TokenSource {
         &self.refresh_token
     }
 
+    /// Whether `token` is this source's refresh token or one it replaced (a copy of the
+    /// sign-in saved before a rotation).
+    pub fn knows(&self, token: &str) -> bool {
+        self.refresh_token == token || self.earlier.iter().any(|t| t == token)
+    }
+
     /// A valid access token, fetched when there is none or it is about to expire.
     pub fn bearer(&mut self, net: &Net) -> Result<String> {
         if let Some((token, until)) = &self.access
@@ -174,8 +184,11 @@ impl TokenSource {
             return Ok(token.clone());
         }
         let tokens = refresh(&self.client, net, &self.refresh_token)?;
-        if let Some(rotated) = tokens.refresh_token.filter(|t| !t.is_empty()) {
-            self.refresh_token = rotated;
+        if let Some(rotated) = tokens.refresh_token.filter(|t| !t.is_empty() && *t != self.refresh_token) {
+            if self.earlier.len() >= EARLIER_TOKENS {
+                self.earlier.remove(0);
+            }
+            self.earlier.push(std::mem::replace(&mut self.refresh_token, rotated));
         }
         // a minute early; a hostile lifetime can't overflow the clock
         let life = tokens.expires_in.unwrap_or(3600).min(86_400).saturating_sub(60);

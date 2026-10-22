@@ -283,7 +283,11 @@ fn opendrive_signs_in_with_its_password_backs_up_and_restores() {
 
     // the sign-in ran out (30 days unused, or another device used it): Check Accounts says so, and
     // signing in again fixes the same account, which keeps its id and its files
-    state.lock().unwrap().refresh = "expired".into();
+    {
+        let mut st = state.lock().unwrap();
+        st.refresh = "expired".into();
+        st.access.clear();
+    }
     s.execute("cloud.refresh", &json!({"wait": true})).unwrap();
     let st = s.execute("cloud.status", &Value::Null).unwrap();
     assert!(st["accounts"][0]["error"].as_str().unwrap_or_default().contains("sign in again"), "{st}");
@@ -393,4 +397,60 @@ fn opendrive_folders_become_an_album_plan_without_changing_them() {
     assert!(s.execute("cloud.scanFolders", &json!({"account": id, "roots": []})).is_err());
     drop(s);
     let _ = std::fs::remove_dir_all(lib);
+}
+
+/// OpenDrive replaces its refresh token on every refresh: the drive's worker and a backup using
+/// the same account at once must not leave each other (or the vault) with a dead one.
+#[test]
+fn opendrive_shared_by_the_drive_and_a_backup() {
+    use fake_http::opendrive::{PASS as OD_PASS, USER, start};
+    let (state, api) = start();
+    let (mut s, lib, src, acc1, acc2) = backed_up_library("od-shared");
+    for id in s.execute("cloud.status", &Value::Null).unwrap()["accounts"].as_array().unwrap().iter().map(|a| a["id"].clone()).collect::<Vec<_>>() {
+        s.execute("cloud.removeAccount", &json!({ "id": id })).unwrap();
+    }
+    s.execute("cloud.signIn", &json!({"provider": "opendrive", "username": USER, "password": OD_PASS, "api": api, "label": "OpenDrive"})).unwrap();
+    assert_eq!(wait_for_sign_in(&mut s)["state"], "added");
+    let id = s.cloud.vault.as_ref().unwrap().accounts[0].id.clone();
+    s.execute("cloud.setAccount", &json!({"id": id, "cap": 50_000_000u64})).unwrap();
+    let r = s.execute("cloud.backup", &json!({"wait": true})).unwrap();
+    assert_eq!((r["failed"].as_u64(), r["error"].is_null()), (Some(0), true), "{r}");
+
+    let files = temp_dir("od-shared-files");
+    let upload = |s: &mut Session, name: &str, wait: bool| {
+        let path = files.join(name);
+        std::fs::write(&path, name.repeat(50)).unwrap();
+        s.execute("drive.upload", &json!({"path": path.to_string_lossy(), "wait": wait})).unwrap()
+    };
+    let failed = |s: &mut Session| -> Vec<Value> {
+        let t = s.execute("drive.transfers", &Value::Null).unwrap();
+        t["tasks"].as_array().unwrap().iter().filter(|t| t["state"] == "failed").cloned().collect()
+    };
+    upload(&mut s, "first.txt", true);
+    assert!(failed(&mut s).is_empty(), "{:?}", failed(&mut s));
+    for round in 0..3 {
+        // drive uploads queued, then a backup while the worker runs them
+        for i in 0..4 {
+            upload(&mut s, &format!("r{round}-{i}.txt"), false);
+        }
+        let r = s.execute("cloud.backup", &json!({"wait": true})).unwrap();
+        assert_eq!((r["failed"].as_u64(), r["error"].as_str()), (Some(0), None), "round {round}: {r}");
+        s.execute("drive.wait", &Value::Null).unwrap();
+        assert!(failed(&mut s).is_empty(), "round {round}: {:?}", failed(&mut s));
+    }
+    // and the vault ends up with the token that works now
+    s.execute("drive.wait", &Value::Null).unwrap();
+    let r = s.execute("cloud.backup", &json!({"wait": true})).unwrap();
+    assert_eq!((r["failed"].as_u64(), r["error"].as_str()), (Some(0), None), "{r}");
+    let live = state.lock().unwrap().refresh.clone();
+    let st = s.execute("cloud.status", &Value::Null).unwrap();
+    assert!(st["accounts"][0]["error"].is_null(), "{st}");
+    assert_eq!(s.cloud.vault.as_ref().unwrap().accounts[0].config["refresh_token"], live.as_str());
+    let saved = std::fs::read(lib.join("cloud/vault.enc")).unwrap();
+    let vault = lightcraft_cloud::Vault::open(&saved, PASS).unwrap();
+    assert_eq!(vault.accounts[0].config["refresh_token"], live.as_str(), "the vault on disk too");
+    drop(s);
+    for d in [lib, src, acc1, acc2, files] {
+        let _ = std::fs::remove_dir_all(d);
+    }
 }

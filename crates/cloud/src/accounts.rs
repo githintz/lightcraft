@@ -104,12 +104,12 @@ pub fn sign_in(mut secret: AccountSecret, net: &Net) -> Result<AccountSecret> {
 pub fn updated_secret(secret: &AccountSecret, provider: &dyn Provider) -> Option<AccountSecret> {
     let token = provider.refresh_token()?;
     let stored = secret.config.get("refresh_token").and_then(|v| v.as_str())?;
-    if stored == token {
+    if stored == token.as_str() {
         return None;
     }
     let mut s = secret.clone();
     if let Some(obj) = s.config.as_object_mut() {
-        obj.insert("refresh_token".into(), serde_json::Value::String(token.to_string()));
+        obj.insert("refresh_token".into(), serde_json::Value::String(token));
     }
     Some(s)
 }
@@ -133,11 +133,11 @@ mod tests {
         let dav = serde_json::json!({"url": "https://dav.example/lc/", "user": "u", "password": "p"});
         assert_eq!(open(&secret("webdav", dav), false).unwrap().info().provider, "webdav");
         let p = open(&secret("opendrive", serde_json::json!({"refresh_token": "r"})), false).unwrap();
-        assert_eq!((p.info().provider.as_str(), p.refresh_token()), ("opendrive", Some("r")));
+        assert_eq!((p.info().provider.as_str(), p.refresh_token().as_deref()), ("opendrive", Some("r")));
         for kind in ["gdrive", "onedrive", "dropbox"] {
             let p = open(&secret(kind, serde_json::json!({"client_id": "c", "refresh_token": "r"})), false).unwrap();
             assert_eq!(p.info().provider, kind);
-            assert_eq!(p.refresh_token(), Some("r"));
+            assert_eq!(p.refresh_token().as_deref(), Some("r"));
         }
         assert!(matches!(open(&secret("terabox", serde_json::json!({})), false), Err(CloudError::Unsupported(_))));
         assert!(open(&secret("gdrive", serde_json::json!({"client_id": 5})), false).is_err());

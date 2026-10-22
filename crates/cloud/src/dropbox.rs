@@ -369,8 +369,8 @@ impl DropboxProvider {
 }
 
 impl Provider for DropboxProvider {
-    fn refresh_token(&self) -> Option<&str> {
-        Some(self.tokens.refresh_token())
+    fn refresh_token(&self) -> Option<String> {
+        Some(self.tokens.refresh_token().to_string())
     }
 
     fn info(&self) -> ProviderInfo {

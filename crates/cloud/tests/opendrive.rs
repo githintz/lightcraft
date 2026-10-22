@@ -158,15 +158,22 @@ fn sign_in_exchanges_the_password_once_and_tokens_rotate() {
     let mut p = OpenDriveProvider::new(config, "OpenDrive").unwrap();
     p.quota().unwrap();
     // using it replaced the refresh token; the provider has the new one for the vault
-    assert_ne!(Provider::refresh_token(&p), Some(first.as_str()));
-    assert_eq!(Provider::refresh_token(&p), Some(state.lock().unwrap().refresh.as_str()));
+    assert_ne!(Provider::refresh_token(&p), Some(first.clone()));
+    assert_eq!(Provider::refresh_token(&p), Some(state.lock().unwrap().refresh.clone()));
     // an access token that stopped working is replaced once, with the rotated refresh token
     state.lock().unwrap().access.clear();
     p.quota().unwrap();
-    // the old refresh token no longer works
+    // the old refresh token no longer works at OpenDrive, but a provider opened from a copy saved
+    // before the rotation (a vault read before another worker refreshed) shares the live sign-in
     let stale = OpenDriveConfig::new(&base, first);
     let mut old = OpenDriveProvider::new(stale, "old").unwrap();
-    assert!(matches!(old.quota(), Err(CloudError::Denied(m)) if m.starts_with("sign in again")));
+    old.quota().unwrap();
+    assert_eq!(old.refresh_token(), p.refresh_token());
+    let refreshes = state.lock().unwrap().refreshes;
+    // and a token this process never had is refused
+    let mut unknown = OpenDriveProvider::new(OpenDriveConfig::new(&base, "rt-0"), "unknown").unwrap();
+    assert!(matches!(unknown.quota(), Err(CloudError::Denied(m)) if m.starts_with("sign in again")));
+    assert_eq!(state.lock().unwrap().refreshes, refreshes);
 }
 
 #[test]

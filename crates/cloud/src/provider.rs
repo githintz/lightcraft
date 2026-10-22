@@ -66,7 +66,7 @@ pub trait Provider: Send {
 
     /// The OAuth refresh token in use, for providers that sign in with one: some providers
     /// rotate it, and the vault must then store the new one.
-    fn refresh_token(&self) -> Option<&str> {
+    fn refresh_token(&self) -> Option<String> {
         None
     }
 }
