@@ -170,6 +170,8 @@ pub struct Transfers {
     pub quotas: Mutex<BTreeMap<String, std::result::Result<Quota, String>>>,
     /// Accounts whose credentials changed (rotated refresh tokens), for the vault.
     pub updated: Mutex<Vec<AccountSecret>>,
+    /// The sealed vault last put on the accounts (with every account's marker) by this session.
+    vault_put: Mutex<Option<ContentId>>,
 }
 
 impl Transfers {
@@ -550,10 +552,20 @@ impl Worker {
     /// The drive metadata (if it changed) and the manifest, to every account and the library.
     fn save(&mut self) -> Result<(), String> {
         self.transfers.meta_dirty.store(false, Ordering::Relaxed);
-        let meta = serde_json::to_vec(&*lock(&self.meta)).map_err(|e| e.to_string())?;
-        let library = self.ctx.library.clone();
+        let (library, settings) = (self.ctx.library.clone(), self.ctx.settings.clone());
         let (shared, transfers, shared_meta) = (self.manifest.clone(), self.transfers.clone(), self.meta.clone());
         let fleet = self.fleet()?;
+        // another device may have saved since this one last read the accounts: its changes are
+        // merged in first, so this save holds both (and may then clean up its snapshot)
+        if let Ok(remote) = fleet.load_manifest() {
+            let remote_meta = remote.get(META_ID).and_then(|e| fleet.restore(&e).ok()).and_then(|b| serde_json::from_slice::<DriveMeta>(&b).ok());
+            lock(&shared).merge(&remote).map_err(|e| e.to_string())?;
+            fleet.manifest.merge(&remote).map_err(|e| e.to_string())?;
+            if let Some(m) = remote_meta {
+                lock(&shared_meta).merge(&m);
+            }
+        }
+        let meta = serde_json::to_vec(&*lock(&shared_meta)).map_err(|e| e.to_string())?;
         let old = fleet.manifest.get(META_ID);
         let item = Item { id: META_ID.into(), name: META_FILE.into(), level: Availability::Instant, copies: 1, everywhere: true };
         if let Ok(Outcome::Stored(_)) = fleet.backup(&item, &meta, &mut OsRandom)
@@ -569,7 +581,8 @@ impl Worker {
             shared.merge(&fleet.manifest).map_err(|e| e.to_string())?;
             fleet.manifest = shared.clone();
         }
-        let errors = fleet.save_manifest(&mut OsRandom).map_err(|e| format!("couldn't save the drive to any storage account: {e}"))?;
+        let mut errors = fleet.save_manifest(&mut OsRandom).map_err(|e| format!("couldn't save the drive to any storage account: {e}"))?;
+        errors.extend(put_vault(fleet, &library, &settings, &transfers));
         {
             let mut q = lock(&transfers.quotas);
             for (id, e) in &errors {
@@ -597,6 +610,34 @@ impl Worker {
             }
         }
     }
+}
+
+/// The library's sealed vault and each account's marker on every account, as a backup leaves
+/// them: without the vault (the data key) no file in the accounts can be read, so the drive is
+/// restored from any one account and its passphrase, like the library. Put again only when the
+/// vault changed (accounts added, a rotated sign-in, a new passphrase).
+fn put_vault(fleet: &mut Fleet, library: &Path, settings: &CloudSettings, transfers: &Transfers) -> Vec<(String, lightcraft_cloud::CloudError)> {
+    let Ok(sealed) = std::fs::read(cloud::dir(library).join(cloud::VAULT_FILE)) else { return Vec::new() };
+    // the vault and the markers' settings: either changing puts them again
+    let id = ContentId::of(&[sealed.as_slice(), cloud::marker("", settings).as_bytes()].concat());
+    if lock(&transfers.vault_put).as_ref() == Some(&id) {
+        return Vec::new();
+    }
+    let mut errors = Vec::new();
+    if let Ok(name) = lightcraft_cloud::ObjectName::parse(lightcraft_cloud::backup::VAULT_NAME) {
+        errors = fleet.put_everywhere(&name, &sealed);
+    }
+    if let Ok(name) = lightcraft_cloud::ObjectName::parse(cloud::ACCOUNT_MARKER) {
+        for a in &mut fleet.accounts {
+            if let Err(e) = a.provider.put(&name, cloud::marker(&a.id, settings).as_bytes()) {
+                errors.push((a.id.clone(), e));
+            }
+        }
+    }
+    if errors.is_empty() {
+        *lock(&transfers.vault_put) = Some(id);
+    }
+    errors
 }
 
 /// Clean an item name: no path separators or control characters, at most [`MAX_NAME`] bytes.

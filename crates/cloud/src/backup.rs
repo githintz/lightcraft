@@ -99,14 +99,32 @@ pub struct Fleet {
     pub device: String,
     pub manifest: Manifest,
     pub weights: Weights,
+    /// The snapshots [`Fleet::load_manifest`] merged (other devices' ones may be removed once a
+    /// snapshot holding them is saved).
+    merged: std::collections::BTreeSet<String>,
 }
 
-fn snapshot_name(clock: u64) -> String {
-    format!("manifest/snapshot-{clock}.json.enc")
+/// Most snapshots [`Fleet::load_manifest`] reads and merges (the newest).
+pub const MERGE_SNAPSHOTS: usize = 8;
+
+/// A snapshot's name: the manifest's clock and the device that wrote it, so two devices saving
+/// at the same clock don't overwrite each other.
+fn snapshot_name(clock: u64, device: &str) -> String {
+    let device: String = device.chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-').take(40).collect();
+    if device.is_empty() { format!("manifest/snapshot-{clock}.json.enc") } else { format!("manifest/snapshot-{clock}-{device}.json.enc") }
+}
+
+/// `(clock, device)` of a snapshot name (older ones have no device).
+fn snapshot_parts(name: &str) -> Option<(u64, Option<&str>)> {
+    let rest = name.strip_prefix("manifest/snapshot-")?.strip_suffix(".json.enc")?;
+    match rest.split_once('-') {
+        Some((clock, device)) => Some((clock.parse().ok()?, Some(device).filter(|d| !d.is_empty()))),
+        None => Some((rest.parse().ok()?, None)),
+    }
 }
 
 fn snapshot_clock(name: &str) -> Option<u64> {
-    name.strip_prefix("manifest/snapshot-")?.strip_suffix(".json.enc")?.parse().ok()
+    snapshot_parts(name).map(|(c, _)| c)
 }
 
 /// Largest ciphertext of a `plain`-byte blob (whatever segment size it was written with).
@@ -116,7 +134,7 @@ fn max_cipher(plain: u64) -> u64 {
 
 impl Fleet {
     pub fn new(accounts: Vec<Account>, data_key: Key, device: impl Into<String>, manifest: Manifest) -> Fleet {
-        Fleet { accounts, data_key, device: device.into(), manifest, weights: Weights::default() }
+        Fleet { accounts, data_key, device: device.into(), manifest, weights: Weights::default(), merged: Default::default() }
     }
 
     fn account_mut(&mut self, id: &str) -> Option<&mut Account> {
@@ -194,9 +212,23 @@ impl Fleet {
         if same && (holding.len() >= wanted || (item.everywhere && open.iter().all(|a| holding.contains(a)))) {
             return Ok(Outcome::Unchanged);
         }
+        // accounts that already hold these bytes for another entry: the copy there is shared (the
+        // blob is named by its content) instead of sent again
+        let mut reuse: Vec<(String, String)> = Vec::new();
+        let shared_on = self.held_elsewhere(&item.id, &content);
+        for (account, key) in shared_on {
+            let want_more = if item.everywhere { open.contains(&account) } else { holding.len() + reuse.len() < wanted };
+            if want_more && !holding.contains(&account) {
+                reuse.push((account, key));
+            }
+        }
+        let reused: Vec<String> = reuse.iter().map(|(a, _)| a.clone()).collect();
+        let holding: Vec<String> = holding.into_iter().chain(reused.iter().cloned()).collect();
 
         let targets: Vec<String> = if item.everywhere {
             open.into_iter().filter(|a| !holding.contains(a)).collect()
+        } else if holding.len() >= wanted {
+            Vec::new()
         } else {
             let missing = wanted.saturating_sub(holding.len());
             let candidates = self.placement_accounts(&holding);
@@ -207,16 +239,25 @@ impl Fleet {
             };
             match placement::choose(&candidates, &req, &self.weights) {
                 Ok(chosen) => chosen.into_iter().map(|a| a.id.clone()).collect(),
-                // fewer providers than copies asked for: as many as there are
+                // fewer providers than copies asked for: one on each provider first, then on
+                // other accounts (two disks are two places even if both are folders)
                 Err(placement::PlacementError::NotEnoughProviders) if missing > 1 => {
                     let req = PlacementRequest { copies: 1, ..req };
-                    let mut picked = Vec::new();
-                    let mut cands = candidates;
+                    let mut picked: Vec<String> = Vec::new();
+                    let mut cands = candidates.clone();
                     while picked.len() < missing {
                         let Ok(c) = placement::choose(&cands, &req, &self.weights) else { break };
                         let Some(first) = c.first() else { break };
                         let (id, provider) = (first.id.clone(), first.provider.clone());
                         cands.retain(|a| a.provider != provider);
+                        picked.push(id);
+                    }
+                    let mut rest: Vec<PlacementAccount> = candidates.into_iter().filter(|a| !picked.contains(&a.id)).collect();
+                    while picked.len() < missing {
+                        let Ok(c) = placement::choose(&rest, &req, &self.weights) else { break };
+                        let Some(first) = c.first() else { break };
+                        let id = first.id.clone();
+                        rest.retain(|a| a.id != id);
                         picked.push(id);
                     }
                     if picked.is_empty() {
@@ -228,7 +269,6 @@ impl Fleet {
             }
         };
 
-        let cipher = crypto::encrypt(&self.data_key, data, rng)?;
         let name = ObjectName::blob(&content);
         if !same {
             match &existing {
@@ -249,9 +289,13 @@ impl Fleet {
             }
             self.record(OpKind::SetAvailability { id: item.id.clone(), availability: item.level })?;
         }
+        for (account, key) in &reuse {
+            self.record(OpKind::AddReplica { id: item.id.clone(), account: account.clone(), key: key.clone() })?;
+        }
 
-        let mut stored = Vec::new();
+        let mut stored = reused;
         let mut first_error = None;
+        let cipher = if targets.is_empty() { Vec::new() } else { crypto::encrypt(&self.data_key, data, rng)? };
         for id in targets {
             let Some(account) = self.account_mut(&id) else { continue };
             match account.provider.put(&name, &cipher) {
@@ -273,6 +317,20 @@ impl Fleet {
             (true, Some(e)) => Err(e),
             _ => Ok(Outcome::Stored(stored)),
         }
+    }
+
+    /// `(account, key)` of the copies of `content` other entries hold on accounts of this fleet
+    /// (one per account).
+    fn held_elsewhere(&self, id: &str, content: &ContentId) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for e in self.manifest.entries().filter(|e| e.id != id && e.content.as_ref() == Some(content)) {
+            for (account, key) in e.replicas {
+                if self.accounts.iter().any(|a| a.id == account && a.settings.accepts_uploads) && !out.iter().any(|(a, _)| *a == account) {
+                    out.push((account, key));
+                }
+            }
+        }
+        out
     }
 
     /// Mark the entries `scope` accepts that are not in `keep` as trashed (their files are gone
@@ -329,19 +387,31 @@ impl Fleet {
         let plain = self.manifest.to_snapshot()?;
         let cipher = crypto::encrypt(&self.data_key, &plain, rng)?;
         let clock = self.manifest.clock();
-        let name = ObjectName::parse(&snapshot_name(clock))?;
+        let name = ObjectName::parse(&snapshot_name(clock, &self.device))?;
         let mut errors = Vec::new();
         let mut saved = 0usize;
         for a in &mut self.accounts {
             match a.provider.put(&name, &cipher) {
                 Ok(_) => {
                     saved += 1;
-                    // the newest snapshots stay; a failed clean-up only costs space
+                    // clean up (a failure only costs space): this device's newest snapshots stay;
+                    // another device's go only once this one holds them (it merged them), so a
+                    // device saving never loses another's changes
                     if let Ok(listed) = a.provider.list() {
-                        let mut snaps: Vec<(u64, RemoteRef)> =
-                            listed.into_iter().filter_map(|l| snapshot_clock(l.name.as_str()).map(|c| (c, l.remote))).collect();
-                        snaps.sort_by_key(|s| std::cmp::Reverse(s.0));
-                        for (_, r) in snaps.into_iter().skip(KEEP_SNAPSHOTS) {
+                        let mut own: Vec<(u64, RemoteRef)> = Vec::new();
+                        for l in listed {
+                            let Some((c, device)) = snapshot_parts(l.name.as_str()) else { continue };
+                            if l.name.as_str() == name.as_str() {
+                                continue;
+                            }
+                            if device == Some(self.device.as_str()) {
+                                own.push((c, l.remote));
+                            } else if self.merged.contains(l.name.as_str()) && c <= clock {
+                                let _ = a.provider.delete(&l.remote);
+                            }
+                        }
+                        own.sort_by_key(|s| std::cmp::Reverse(s.0));
+                        for (_, r) in own.into_iter().skip(KEEP_SNAPSHOTS.saturating_sub(1)) {
                             let _ = a.provider.delete(&r);
                         }
                     }
@@ -368,28 +438,47 @@ impl Fleet {
 
     /// The newest manifest any account holds that opens with the data key.
     pub fn load_manifest(&mut self) -> Result<Manifest> {
-        let mut snaps: Vec<(u64, usize, RemoteRef)> = Vec::new();
+        // every account's snapshots, by name (the same snapshot is on every account)
+        let mut snaps: BTreeMap<String, (u64, Vec<(usize, RemoteRef)>)> = BTreeMap::new();
         let mut last_error = None;
         for (i, a) in self.accounts.iter_mut().enumerate() {
             match a.provider.list() {
-                Ok(listed) => snaps.extend(listed.into_iter().filter_map(|l| snapshot_clock(l.name.as_str()).map(|c| (c, i, l.remote)))),
+                Ok(listed) => {
+                    for l in listed {
+                        if let Some(c) = snapshot_clock(l.name.as_str()) {
+                            snaps.entry(l.name.as_str().to_string()).or_insert_with(|| (c, Vec::new())).1.push((i, l.remote));
+                        }
+                    }
+                }
                 Err(e) => last_error = Some(e),
             }
         }
-        snaps.sort_by_key(|s| std::cmp::Reverse(s.0));
-        for (_, i, remote) in snaps {
-            let Some(a) = self.accounts.get_mut(i) else { continue };
-            let read = a
-                .provider
-                .get(&remote, max_cipher(MAX_MANIFEST as u64))
-                .and_then(|c| crypto::decrypt(&self.data_key, &c, MAX_MANIFEST as u64))
-                .and_then(|p| Manifest::from_snapshot(&p, MAX_MANIFEST));
-            match read {
-                Ok(m) => return Ok(m),
-                Err(e) => last_error = Some(e),
+        // the newest ones (several devices may each have saved one): all merged
+        let mut order: Vec<(String, (u64, Vec<(usize, RemoteRef)>))> = snaps.into_iter().collect();
+        order.sort_by_key(|(_, (c, _))| std::cmp::Reverse(*c));
+        let mut merged: Option<Manifest> = None;
+        for (name, (_, copies)) in order.into_iter().take(MERGE_SNAPSHOTS) {
+            for (i, remote) in copies {
+                let Some(a) = self.accounts.get_mut(i) else { continue };
+                let read = a
+                    .provider
+                    .get(&remote, max_cipher(MAX_MANIFEST as u64))
+                    .and_then(|c| crypto::decrypt(&self.data_key, &c, MAX_MANIFEST as u64))
+                    .and_then(|p| Manifest::from_snapshot(&p, MAX_MANIFEST));
+                match read {
+                    Ok(m) => {
+                        match merged.as_mut() {
+                            Some(all) => all.merge(&m)?,
+                            None => merged = Some(m),
+                        }
+                        self.merged.insert(name);
+                        break;
+                    }
+                    Err(e) => last_error = Some(e),
+                }
             }
         }
-        Err(last_error.unwrap_or(CloudError::NotFound))
+        merged.ok_or_else(|| last_error.unwrap_or(CloudError::NotFound))
     }
 
     /// An entry's content, read from any account holding it, decrypted and checked against its

@@ -161,6 +161,86 @@ fn change_passphrase(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"changed": true, "note": "the accounts get the new vault with the next backup"}))
 }
 
+/// `p` made absolute and resolved as far as it exists (links, `.`), for comparing folders;
+/// `None` for a relative path or one with `..` past what exists.
+fn resolved(p: &std::path::Path) -> Option<PathBuf> {
+    if !p.is_absolute() {
+        return None;
+    }
+    let (mut existing, mut rest) = (p.to_path_buf(), Vec::new());
+    loop {
+        if let Ok(mut out) = std::fs::canonicalize(&existing) {
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return Some(out);
+        }
+        rest.push(existing.file_name()?.to_os_string());
+        if !existing.pop() {
+            return None;
+        }
+    }
+}
+
+/// A folder account's folder must be its own: not another account's (two "copies" would be one
+/// file, and deleting from one account would delete the other's), not inside or around one, and
+/// not inside the library.
+fn check_folder_account(s: &Session, library: &std::path::Path, config: &Value, c: &str) -> Result<()> {
+    let path = config.get("path").and_then(Value::as_str).filter(|p| !p.trim().is_empty()).ok_or_else(|| bad(c, "a folder account needs `path`"))?;
+    let new = resolved(std::path::Path::new(path)).ok_or_else(|| bad(c, "give the folder's full path"))?;
+    if resolved(library).is_some_and(|lib| new.starts_with(&lib)) {
+        return Err(bad(c, "a storage folder can't be inside the library's own folder"));
+    }
+    let accounts = s.cloud.vault.as_ref().map(|v| v.accounts.clone()).unwrap_or_default();
+    for a in accounts.iter().filter(|a| a.provider == "folder") {
+        let Some(other) = a.config.get("path").and_then(Value::as_str).and_then(|p| resolved(std::path::Path::new(p))) else { continue };
+        if new.starts_with(&other) || other.starts_with(&new) {
+            return Err(bad(c, format!("that folder is already storage (“{}”), or inside or around it", a.label)));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse an account that holds another LightCraft vault (another drive or backup, sealed with
+/// another passphrase): this library would overwrite that vault and its manifests, and the other
+/// one's files couldn't be read any more. Its own vault (an account removed and added again) is
+/// fine.
+fn foreign_vault(s: &Session, provider: &mut dyn lightcraft_cloud::Provider, c: &str) -> Result<()> {
+    let listed = provider.list().map_err(|e| bad(c, format!("the account doesn't work: {e}")))?;
+    let Some(found) = listed.iter().find(|l| l.name.as_str() == lightcraft_cloud::backup::VAULT_NAME) else { return Ok(()) };
+    let theirs = provider.get(&found.remote, lightcraft_cloud::vault::MAX_VAULT as u64).ok();
+    let ours = s.cloud.vault.as_ref().map(|v| &v.data_key);
+    let same = match (theirs, s.cloud.passphrase()) {
+        (Some(sealed), Some(pass)) => lightcraft_cloud::Vault::open(&sealed, &pass).ok().is_some_and(|v| Some(&v.data_key) == ours),
+        _ => false,
+    };
+    if same {
+        Ok(())
+    } else {
+        Err(bad(
+            c,
+            "this storage already holds another LightCraft drive or backup (another passphrase): choose another folder or account, \
+             or use that drive from a library that isn't set up yet (cloud.join)",
+        ))
+    }
+}
+
+/// Use the drive and storage another computer set up (any one of its accounts and the
+/// passphrase), from a library that isn't set up yet.
+fn join(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "cloud.join";
+    let dir = library_dir(s, C)?;
+    idle(s, C)?;
+    let provider = str_param(p, "provider")
+        .filter(|k| accounts::KINDS.contains(k))
+        .ok_or_else(|| bad(C, format!("`provider` is one of {}", accounts::KINDS.join(", "))))?;
+    let config = p.get("config").filter(|v| v.is_object()).cloned().ok_or_else(|| bad(C, "missing `config` object: one of the drive's accounts"))?;
+    let pass = passphrase(p, "passphrase", C)?.to_string();
+    let source = AccountSecret { id: "join-source".into(), provider: provider.to_string(), label: provider.to_string(), config };
+    let labels = s.cloud.join(&dir, source, &pass).map_err(|e| bad(C, e))?;
+    Ok(json!({"configured": true, "unlocked": true, "accounts": labels}))
+}
+
 fn add_account(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "cloud.addAccount";
     let dir = library_dir(s, C)?;
@@ -174,6 +254,9 @@ fn add_account(s: &mut Session, p: &Value) -> Result<Value> {
     let label = str_param(p, "label").filter(|l| !l.trim().is_empty()).unwrap_or(provider).trim().chars().take(100).collect::<String>();
     let mut settings = AccountSettings::default();
     read_settings(p, &mut settings, C)?;
+    if provider == "folder" {
+        check_folder_account(s, &dir, &config, C)?;
+    }
     let id = new_account_id().map_err(|e| bad(C, e))?;
     let secret = AccountSecret { id, provider: provider.to_string(), label, config };
     // an OpenDrive account given by its password: exchanged for a token here, never stored
@@ -181,6 +264,7 @@ fn add_account(s: &mut Session, p: &Value) -> Result<Value> {
     // make the app folder / bucket and read the quota: an account that doesn't work isn't added
     if super::bool_or(p, "check", true) {
         let mut opened = accounts::open(&secret, true).map_err(|e| bad(C, format!("the account doesn't work: {e}")))?;
+        foreign_vault(s, opened.as_mut(), C)?;
         match opened.quota() {
             Ok(q) => {
                 s.cloud.quotas.insert(secret.id.clone(), Ok(q));
@@ -435,7 +519,8 @@ fn plan_items(s: &mut Session, dir: &std::path::Path, c: &str) -> Result<Vec<(It
     // nothing that changes by itself (a time) goes in, so an unchanged library sends nothing
     let info = json!({"format": "lightcraft-library-info", "dir": dir.to_string_lossy(), "device": s.cloud.settings.device});
     items.push((everywhere("library.info".into(), "library"), Source::Bytes(info.to_string().into_bytes())));
-    let settings = cloud::CloudSettings { last_backup: None, ..s.cloud.settings.clone() };
+    // nothing that changes by itself goes in (the time; "backed up", true once this one ends)
+    let settings = cloud::CloudSettings { last_backup: None, backed_up: true, ..s.cloud.settings.clone() };
     let settings = serde_json::to_vec(&settings).map_err(|e| bad(c, e.to_string()))?;
     items.push((everywhere("cloud.settings".into(), "cloud settings"), Source::Bytes(settings)));
 
@@ -578,6 +663,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(query "cloud.status", "Cloud Backup Status", [], None, "{} → {available, configured, unlocked, accounts: [{id, provider, label, settings: {cap, speed, priority, acceptsUploads}, quota: {total, used}, error}], originalCopies, smartPreviews, clientIds, lastBackup, job, signIn}", always, status),
         cmd!(query "cloud.setup", "Set Up Cloud Backup", [], None, "{passphrase} — create the library's cloud vault (a new data key, no accounts) sealed with the passphrase (8+ characters; a lost passphrase loses the backup)", always, setup),
         cmd!(query "cloud.unlock", "Unlock Cloud Backup", [], None, "{passphrase}", always, unlock),
+        cmd!(query "cloud.join", "Use an Existing Drive", [], None, "{provider, config, passphrase} — from a library not set up yet: use the drive and storage another computer set up, from any one of its accounts (an OpenDrive account by username and password) → {accounts}", always, join),
         cmd!(query "cloud.lock", "Lock Cloud Backup", [], None, "{} — forget the vault and passphrase in memory", always, |s, _| {
             s.cloud.lock();
             Ok(json!({"unlocked": false}))

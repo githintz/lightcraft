@@ -81,8 +81,9 @@ fn files_and_folders_round_trip_through_the_accounts() {
     let t = settle(&mut s);
     assert!(t["tasks"].as_array().unwrap().iter().filter(|x| x["kind"] == "upload").all(|x| x["state"] == "done"), "{t}");
     let first = t["tasks"].as_array().unwrap().iter().find(|x| x["entry"] == report.as_str()).unwrap().clone();
-    // extra copies go to other providers only, and both accounts are folders
-    assert_eq!(first["copies"], 1, "{first}");
+    // two copies asked for: one on each account, though both are folders (two disks are two
+    // places; different providers come first when there are some)
+    assert_eq!(first["copies"], 2, "{first}");
 
     assert_eq!(names(&mut s, "root"), ["Taxes", "notes.txt"]);
     assert_eq!(names(&mut s, &taxes_id), ["report (1).pdf", "report.pdf"]);

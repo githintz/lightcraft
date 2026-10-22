@@ -60,6 +60,10 @@ pub struct CloudSettings {
     /// OAuth client ids by provider (`gdrive`, `onedrive`, `dropbox`), to prefill sign-in.
     pub client_ids: BTreeMap<String, String>,
     pub last_backup: Option<String>,
+    /// This library joined a drive another computer set up (`cloud.join`).
+    pub joined: bool,
+    /// This library has backed up to the accounts at least once.
+    pub backed_up: bool,
 }
 
 impl Default for CloudSettings {
@@ -71,6 +75,8 @@ impl Default for CloudSettings {
             smart_previews: true,
             client_ids: BTreeMap::new(),
             last_backup: None,
+            joined: false,
+            backed_up: false,
         }
     }
 }
@@ -98,6 +104,8 @@ pub struct CloudJob {
     pub updated: Mutex<Vec<AccountSecret>>,
     /// Restore: the restored library's folder and the folders to relink originals from.
     pub restored: Mutex<Option<(PathBuf, Vec<PathBuf>)>>,
+    /// Set once the drive was told about this finished backup.
+    pub drive_told: AtomicBool,
 }
 
 impl CloudJob {
@@ -282,6 +290,50 @@ impl CloudState {
         Ok(())
     }
 
+    /// Use the drive (and storage) another computer set up: the vault from `source`, any one of
+    /// its accounts, opened with `passphrase`, becomes this library's (sealed with the same
+    /// passphrase), with `source`'s fresh credentials, a new device id and `joined` set. The
+    /// drive is then read from the accounts (`drive.*` load it). The labels of the accounts.
+    pub fn join(&mut self, library: &Path, source: AccountSecret, passphrase: &str) -> Result<Vec<String>, String> {
+        if Self::configured(library) {
+            return Err("this library already has its own cloud vault: join from a library that isn't set up yet".into());
+        }
+        let source = accounts::sign_in(source, &lightcraft_cloud::Net::default()).map_err(|e| format!("can't sign in to the account: {e}"))?;
+        let mut provider = accounts::open(&source, false).map_err(|e| format!("can't open the account: {e}"))?;
+        let listed = provider.list().map_err(|e| format!("can't list the account: {e}"))?;
+        let find = |name: &str| listed.iter().find(|l| l.name.as_str() == name).map(|l| l.remote.clone());
+        let vault_ref = find(backup::VAULT_NAME).ok_or("this account holds no LightCraft drive or backup (no vault.enc)")?;
+        let sealed = provider.get(&vault_ref, lightcraft_cloud::vault::MAX_VAULT as u64).map_err(|e| e.to_string())?;
+        let mut vault = Vault::open(&sealed, passphrase).map_err(|e| e.to_string())?;
+        let marker = find(ACCOUNT_MARKER).and_then(|r| provider.get(&r, 64 * 1024).ok()).and_then(|b| serde_json::from_slice::<Marker>(&b).ok());
+        if let Some(a) = marker.as_ref().and_then(|m| vault.accounts.iter_mut().find(|a| a.id == m.id)) {
+            a.config = source.config.clone();
+        }
+        // the accounts' size limits, speeds and pauses as the other device set them
+        let mut account_settings = marker.map(|m| m.accounts).unwrap_or_default();
+        account_settings.retain(|id, _| vault.accounts.iter().any(|a| &a.id == id));
+        // the sign-in this account used just now (a rotated token) is the one to keep
+        let rotated = vault.accounts.iter().find(|a| a.config == source.config).and_then(|a| accounts::updated_secret(a, provider.as_ref()));
+        if let Some(u) = rotated
+            && let Some(a) = vault.accounts.iter_mut().find(|a| a.id == u.id)
+        {
+            *a = u;
+        }
+        let labels = vault.accounts.iter().map(|a| a.label.clone()).collect();
+        self.vault = Some(vault);
+        self.passphrase = Some(passphrase.to_string());
+        self.settings = CloudSettings {
+            device: random_id("dev-").map_err(|e| e.to_string())?,
+            joined: true,
+            accounts: account_settings,
+            ..CloudSettings::default()
+        };
+        self.drive = Default::default();
+        self.save_vault(library)?;
+        self.save_settings(library).map_err(|e| format!("can't save cloud settings: {e}"))?;
+        Ok(labels)
+    }
+
     /// The passphrase while unlocked (a backup reseals the vault with it).
     pub(crate) fn passphrase(&self) -> Option<String> {
         self.passphrase.clone()
@@ -351,7 +403,19 @@ impl CloudState {
             && self.settings.last_backup.as_deref() != Some(now)
         {
             self.settings.last_backup = Some(now.to_string());
+            self.settings.backed_up = true;
             let _ = self.save_settings(library);
+        }
+        // a backup merges into the drive's manifest: the drive saves it to the accounts (once per
+        // backup), so it isn't left "not yet saved" with nothing to do
+        if job.what == "backup" && self.drive.loaded && !job.drive_told.swap(true, Ordering::Relaxed) && self.drive.unsynced() {
+            let has_accounts = self.vault.as_ref().is_some_and(|v| !v.accounts.is_empty());
+            if let (true, Some(vault)) = (has_accounts, self.vault.clone()) {
+                let ctx = crate::drive::WorkerContext { vault, settings: self.settings.clone(), library: library.to_path_buf() };
+                if let Err(e) = self.drive.kick(ctx) {
+                    log::warn!("drive: {e}");
+                }
+            }
         }
     }
 }
@@ -441,15 +505,21 @@ pub fn run_backup(mut plan: BackupPlan, job: &CloudJob) -> Result<(), String> {
         manifest.merge(&m).map_err(|e| e.to_string())?;
     }
     fleet.manifest = manifest;
+    // a library that joined another computer's drive must not back up over that computer's
+    // library: its backup would mark the other library's photos as removed
+    if plan.settings.joined && !plan.settings.backed_up && fleet.manifest.get("library.info").is_some_and(|e| !e.trashed) {
+        return Err("these storage accounts already hold another library's backup (this library joined them for the drive): \
+                    backing it up there would mark that library's photos as removed. Back this library up to other accounts."
+            .into());
+    }
     record_quotas(&mut fleet, job);
 
     // each account says which vault account it is (restore uses it)
     for a in &mut fleet.accounts {
-        if let Ok(name) = ObjectName::parse(ACCOUNT_MARKER) {
-            let marker = json!({"format": "lightcraft-cloud-account", "id": a.id}).to_string();
-            if let Err(e) = a.provider.put(&name, marker.as_bytes()) {
-                lock(&job.quotas).insert(a.id.clone(), Err(e.to_string()));
-            }
+        if let Ok(name) = ObjectName::parse(ACCOUNT_MARKER)
+            && let Err(e) = a.provider.put(&name, marker(&a.id, &plan.settings).as_bytes())
+        {
+            lock(&job.quotas).insert(a.id.clone(), Err(e.to_string()));
         }
     }
 
@@ -564,6 +634,15 @@ fn safe_join(mut base: PathBuf, rel: &Path) -> Option<PathBuf> {
 #[derive(Deserialize)]
 struct Marker {
     id: String,
+    /// Every account's settings as the device that wrote it had them (a joining device starts
+    /// from them: a folder account without its size limit would take nothing).
+    #[serde(default)]
+    accounts: BTreeMap<String, AccountSettings>,
+}
+
+/// The `account.json` an account holds: which vault account it is, and every account's settings.
+pub(crate) fn marker(id: &str, settings: &CloudSettings) -> String {
+    json!({"format": "lightcraft-cloud-account", "id": id, "accounts": settings.accounts}).to_string()
 }
 
 /// Restore a library into `plan.dir` (empty or new). Runs on a worker thread.

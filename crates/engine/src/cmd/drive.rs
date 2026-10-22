@@ -36,6 +36,14 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The reason in an error, without the command's name.
+fn why(e: &crate::EngineError) -> String {
+    match e {
+        crate::EngineError::BadParams { msg, .. } => msg.clone(),
+        e => e.to_string(),
+    }
+}
+
 fn random_hex(n: usize) -> std::result::Result<String, String> {
     let mut b = vec![0u8; n];
     OsRandom.fill(&mut b).map_err(|e| e.to_string())?;
@@ -547,7 +555,20 @@ fn trash(s: &mut Session, p: &Value) -> Result<Value> {
 fn restore(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "drive.restore";
     let dir = ready(s, C)?;
-    let ids = ids_param(p, C)?;
+    let mut ids = ids_param(p, C)?;
+    // folders before what is in them: a child restored with its folder goes back into it
+    {
+        let m = lock(&s.cloud.drive.manifest).clone();
+        let depth = |id: &str| {
+            let (mut n, mut cur) = (0usize, m.effective_parent(id));
+            while let Some(p) = cur.filter(|_| n < MAX_DEPTH) {
+                n += 1;
+                cur = m.effective_parent(&p);
+            }
+            n
+        };
+        ids.sort_by_cached_key(|id| depth(id));
+    }
     for id in &ids {
         let m = lock(&s.cloud.drive.manifest).clone();
         let e = own_item(&m, id, C)?;
@@ -717,8 +738,10 @@ fn upload(s: &mut Session, p: &Value) -> Result<Value> {
         str_param(p, "name").and_then(drive::clean_name).or_else(|| drive::clean_name(&fallback)).ok_or_else(|| bad(C, "the file needs a name"))?;
 
     if !staged && source.is_dir() {
-        // a whole folder: its folders are made now, its files queued
+        // a whole folder: its folders are made now, its files queued; a file that can't be (too
+        // big, unreadable) is reported and the rest goes on
         let mut tasks = Vec::new();
+        let mut skipped: Vec<Value> = Vec::new();
         let (top, _) = make_folder(s, parent.as_deref(), &name, false, C)?;
         let mut stack = vec![(source.clone(), top.clone(), 0usize)];
         while let Some((path, folder, depth)) = stack.pop() {
@@ -736,8 +759,10 @@ fn upload(s: &mut Session, p: &Value) -> Result<Value> {
                     let (sub, _) = make_folder(s, Some(&folder), &n, true, C)?;
                     stack.push((e.path(), sub, depth + 1));
                 } else if t.is_file() {
-                    let (task, _, _) = queue_upload(s, &dir, e.path(), Some(folder.clone()), &n, level, copies, false, C)?;
-                    tasks.push(task);
+                    match queue_upload(s, &dir, e.path(), Some(folder.clone()), &n, level, copies, false, C) {
+                        Ok((task, _, _)) => tasks.push(task),
+                        Err(err) => skipped.push(json!({"name": e.path().to_string_lossy(), "error": why(&err)})),
+                    }
                 }
             }
         }
@@ -745,7 +770,7 @@ fn upload(s: &mut Session, p: &Value) -> Result<Value> {
         if super::bool_or(p, "wait", false) {
             wait_idle(s, &Value::Null)?;
         }
-        return Ok(json!({"folder": top, "tasks": tasks}));
+        return Ok(json!({"folder": top, "tasks": tasks, "skipped": skipped}));
     }
     if !source.is_file() {
         return Err(bad(C, format!("{} is not a file", source.display())));
@@ -769,7 +794,10 @@ fn download(s: &mut Session, p: &Value) -> Result<Value> {
     drive::clean_dir(&out, drive::OUTBOX_AGE);
     std::fs::create_dir_all(&out).map_err(|e| bad(C, format!("can't create {}: {e}", out.display())))?;
     let name = drive::clean_name(drive::base_name(&e.name)).unwrap_or_else(|| "file".into());
-    let dest = out.join(format!("{}-{name}", random_hex(6).map_err(|e| bad(C, e))?));
+    // the file in the outbox gets a plain name (a user's name can hold characters some systems
+    // refuse, like `:` or `?`); the browser gets the real name from drive.file
+    let ext: String = name.rsplit_once('.').map(|(_, x)| x).unwrap_or("").chars().filter(char::is_ascii_alphanumeric).take(12).collect();
+    let dest = out.join(format!("{}{}{ext}", random_hex(8).map_err(|e| bad(C, e))?, if ext.is_empty() { "" } else { "." }));
     let task = queue(s, &dir, "download", &name, Some(&id), e.size, Work::Download { id: id.clone(), dest }, C)?;
     Ok(json!({"task": task}))
 }

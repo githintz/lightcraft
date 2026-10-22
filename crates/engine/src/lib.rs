@@ -879,6 +879,8 @@ mod tests_denoise;
 #[cfg(test)]
 mod tests_drive;
 #[cfg(test)]
+mod tests_drive_edge;
+#[cfg(test)]
 mod tests_export;
 #[cfg(test)]
 mod tests_face_models;
