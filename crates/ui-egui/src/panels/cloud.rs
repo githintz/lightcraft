@@ -27,6 +27,11 @@ struct Form {
     client_id: String,
     /// Google's token endpoint wants the desktop client's secret too (not secret there: RFC 8252 §8.5).
     client_secret: String,
+    /// OpenDrive signs in with the account's own username and password (sent once, kept nowhere).
+    username: String,
+    password: String,
+    /// The account the open sign-in form signs in again to ("" = a new account).
+    account: String,
 }
 
 fn form_id() -> egui::Id {
@@ -55,6 +60,7 @@ fn provider_name(kind: &str) -> &str {
         "gdrive" => "Google Drive",
         "onedrive" => "OneDrive",
         "dropbox" => "Dropbox",
+        "opendrive" => "OpenDrive",
         other => other,
     }
 }
@@ -93,7 +99,7 @@ pub fn settings_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
     hint(
         ui,
         t,
-        "Back this library up, encrypted, to your own storage accounts: a disk or NAS folder, Google Drive, OneDrive, Dropbox. LightCraft runs no server and has no account; only you hold the passphrase.",
+        "Back this library up, encrypted, to your own storage accounts: a disk or NAS folder, Google Drive, OneDrive, Dropbox, OpenDrive. LightCraft runs no server and has no account; only you hold the passphrase.",
     );
     if status["available"] != true {
         hint(ui, t, status["why"].as_str().unwrap_or("Cloud backup needs a library on disk."));
@@ -174,6 +180,18 @@ fn accounts(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, ctx: &egui::
                 ui.add(egui::Label::new(RichText::new(&label).color(t.text)).truncate()).on_hover_text(&label);
             });
             ui.label(detail);
+            // a sign-in that stopped working (expired, revoked, used up on another computer)
+            let kind = a["provider"].as_str().unwrap_or_default();
+            let expired = a["error"].as_str().is_some_and(|e| e.contains("sign in again"));
+            if expired && ["gdrive", "onedrive", "dropbox", "opendrive"].contains(&kind) {
+                let r = ui.small_button(crate::i18n::tr("Sign In Again"));
+                register(ui.ctx(), format!("button:cloudSignInAgain-{i}"), r.rect);
+                if r.clicked() {
+                    form.signing = kind.to_string();
+                    form.account = id.clone();
+                    form.client_id = status["clientIds"][kind].as_str().unwrap_or_default().to_string();
+                }
+            }
             let r = ui.small_button(crate::i18n::tr("Remove"));
             register(ui.ctx(), format!("button:cloudRemove-{i}"), r.rect);
             if r.clicked() && run(app, ctx, "cloud.removeAccount", json!({ "id": id })).is_some() {
@@ -210,16 +228,44 @@ fn accounts(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, ctx: &egui::
                 run(app, ctx, "cloud.addAccount", json!({"provider": "folder", "label": label, "config": {"path": dir}}));
             }
         }
-        for (kind, name) in [("gdrive", "Google Drive…"), ("onedrive", "OneDrive…"), ("dropbox", "Dropbox…")] {
+        for (kind, name) in [("gdrive", "Google Drive…"), ("onedrive", "OneDrive…"), ("dropbox", "Dropbox…"), ("opendrive", "OpenDrive…")] {
             let r = ui.add(egui::Button::new(crate::i18n::tr(name)).selected(form.signing == kind));
             register(ui.ctx(), format!("button:cloudSignIn-{kind}"), r.rect);
             if r.clicked() {
                 form.signing = if form.signing == kind { String::new() } else { kind.to_string() };
+                form.account.clear();
                 form.client_id = status["clientIds"][kind].as_str().unwrap_or_default().to_string();
             }
         }
     });
-    if !form.signing.is_empty() {
+    if form.signing == "opendrive" {
+        row(ui, t, "Username or email", |ui| TextField::singleline("field:cloudUsername", &mut form.username).width(300.0).show(ui));
+        let entered =
+            row(ui, t, "Password", |ui| TextField::singleline("field:cloudPassword", &mut form.password).password(true).width(300.0).show(ui));
+        ui.horizontal(|ui| {
+            ui.add_space(LABEL_W);
+            let ready = !form.username.trim().is_empty() && !form.password.is_empty();
+            let r = ui.add_enabled(ready, egui::Button::new(crate::i18n::tr("Sign In")));
+            register(ui.ctx(), "button:cloudSignInGo", r.rect);
+            if ready && (r.clicked() || entered.committed()) {
+                run(
+                    app,
+                    ctx,
+                    "cloud.signIn",
+                    json!({"provider": "opendrive", "username": form.username.trim(), "password": form.password, "account": Some(&form.account).filter(|a| !a.is_empty())}),
+                );
+                // the password goes no further than the sign-in
+                form.password.clear();
+                form.signing.clear();
+                form.account.clear();
+            }
+        });
+        hint(
+            ui,
+            t,
+            "LightCraft trades the password for a sign-in token and keeps only the token. It lasts 30 days from the last backup or check: back up at least once a month.",
+        );
+    } else if !form.signing.is_empty() {
         let kind = form.signing.clone();
         row(ui, t, "Client ID", |ui| TextField::singleline("field:cloudClientId", &mut form.client_id).width(300.0).show(ui));
         if kind == "gdrive" {
@@ -233,7 +279,7 @@ fn accounts(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, ctx: &egui::
             let r = ui.add_enabled(ready, egui::Button::new(crate::i18n::tr("Sign In in the Browser")));
             register(ui.ctx(), "button:cloudSignInGo", r.rect);
             if r.clicked()
-                && let Some(v) = run(app, ctx, "cloud.signIn", json!({"provider": kind, "clientId": form.client_id.trim(), "clientSecret": Some(form.client_secret.trim()).filter(|s| !s.is_empty())}))
+                && let Some(v) = run(app, ctx, "cloud.signIn", json!({"provider": kind, "clientId": form.client_id.trim(), "clientSecret": Some(form.client_secret.trim()).filter(|s| !s.is_empty()), "account": Some(&form.account).filter(|a| !a.is_empty())}))
             {
                 if let Some(url) = v["url"].as_str()
                     && let Err(e) = crate::links::open(app, url)
@@ -242,6 +288,7 @@ fn accounts(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, ctx: &egui::
                 }
                 form.signing.clear();
                 form.client_secret.clear();
+                form.account.clear();
             }
         });
         hint(ui, t, "The client id of your app registration with this provider (docs/cloud-storage.md says how to make one).");
@@ -258,7 +305,8 @@ fn sign_in_progress(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, ctx:
         Some("waiting") => {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(RichText::new(crate::i18n::tr("Waiting for the sign-in in your browser…")).color(t.text));
+                let text = if s["provider"] == "opendrive" { "Signing in to OpenDrive…" } else { "Waiting for the sign-in in your browser…" };
+                ui.label(RichText::new(crate::i18n::tr(text)).color(t.text));
                 let r = ui.small_button(crate::i18n::tr("Cancel"));
                 register(ui.ctx(), "button:cloudSignInCancel", r.rect);
                 if r.clicked() {

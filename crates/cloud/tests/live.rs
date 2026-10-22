@@ -17,6 +17,8 @@
 //!   (`cloud-signin -- onedrive <client id>`); the run uses a subfolder of the app folder.
 //! - `LIGHTCRAFT_TEST_DROPBOX_CLIENT_ID` / `_REFRESH_TOKEN` — a real Dropbox account with an
 //!   app-folder app (`cloud-signin -- dropbox <app key>`); the run uses a subfolder.
+//! - `LIGHTCRAFT_TEST_OPENDRIVE_USER` / `_PASSWORD` — a real OpenDrive account; the run signs in
+//!   and uses a new folder under `LightCraft-tests/` (left behind, empty).
 //!
 //! Each run uses a fresh app folder, so the contract's "starts empty" holds.
 
@@ -26,6 +28,7 @@ use lightcraft_cloud::dropbox::{DropboxConfig, DropboxProvider};
 use lightcraft_cloud::gdrive::{GoogleDriveConfig, GoogleDriveProvider, MULTIPART_MAX};
 use lightcraft_cloud::oauth::OAuthClient;
 use lightcraft_cloud::onedrive::{OneDriveConfig, OneDriveProvider};
+use lightcraft_cloud::opendrive::OpenDriveProvider;
 use lightcraft_cloud::s3::{S3Config, S3Provider};
 use lightcraft_cloud::webdav::{WebDavConfig, WebDavProvider};
 use lightcraft_cloud::{Provider, contract, store_blob};
@@ -149,4 +152,16 @@ fn dropbox_passes_the_contract() {
     config.root = format!("/{}", run_id());
     let mut p = DropboxProvider::new(config, "live dropbox").unwrap().with_chunk_size(4 * 1024 * 1024).unwrap();
     live_round_trip(&mut p, lightcraft_cloud::dropbox::SIMPLE_MAX + 5_000_000);
+}
+
+#[test]
+fn opendrive_passes_the_contract() {
+    let (Some(user), Some(password)) = (env("LIGHTCRAFT_TEST_OPENDRIVE_USER"), env("LIGHTCRAFT_TEST_OPENDRIVE_PASSWORD")) else {
+        eprintln!("skipped: set LIGHTCRAFT_TEST_OPENDRIVE_USER and _PASSWORD to run against OpenDrive");
+        return;
+    };
+    let mut config = lightcraft_cloud::opendrive::login(None, &user, &password, &lightcraft_cloud::Net::default()).unwrap();
+    config.folder = format!("LightCraft-tests/{}", run_id());
+    let mut p = OpenDriveProvider::new(config, "live opendrive").unwrap().with_chunk_size(4 * 1024 * 1024).unwrap();
+    live_round_trip(&mut p, 9_000_000);
 }

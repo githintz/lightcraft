@@ -6,12 +6,13 @@ use serde::Deserialize;
 use crate::dropbox::{DropboxConfig, DropboxProvider};
 use crate::gdrive::{GoogleDriveConfig, GoogleDriveProvider};
 use crate::onedrive::{OneDriveConfig, OneDriveProvider};
+use crate::opendrive::{OpenDriveConfig, OpenDriveProvider};
 use crate::s3::{S3Config, S3Provider};
 use crate::webdav::{WebDavConfig, WebDavProvider};
-use crate::{AccountSecret, CloudError, FolderProvider, Provider, Result};
+use crate::{AccountSecret, CloudError, FolderProvider, Net, Provider, Result};
 
 /// Every provider kind an account can be.
-pub const KINDS: &[&str] = &["folder", "s3", "webdav", "gdrive", "onedrive", "dropbox"];
+pub const KINDS: &[&str] = &["folder", "s3", "webdav", "gdrive", "onedrive", "dropbox", "opendrive"];
 
 /// A folder account's configuration.
 #[derive(Deserialize)]
@@ -60,8 +61,42 @@ pub fn open(secret: &AccountSecret, create: bool) -> Result<Box<dyn Provider>> {
         }
         "onedrive" => Box::new(OneDriveProvider::new(config::<OneDriveConfig>(secret)?, label)?),
         "dropbox" => Box::new(DropboxProvider::new(config::<DropboxConfig>(secret)?, label)?),
+        "opendrive" => {
+            let mut p = OpenDriveProvider::new(config::<OpenDriveConfig>(secret)?, label)?;
+            if create {
+                p.ensure_root()?;
+            }
+            Box::new(p)
+        }
         other => return Err(CloudError::Unsupported(format!("storage provider {:?}", other.chars().take(32).collect::<String>()))),
     })
+}
+
+/// An OpenDrive account's sign-in, as given when it is added or restored from.
+#[derive(Deserialize)]
+struct OpenDriveLogin {
+    username: String,
+    password: String,
+    #[serde(default)]
+    folder: Option<String>,
+    #[serde(default)]
+    api: Option<String>,
+}
+
+/// `secret` ready to [`open`]: an OpenDrive account given by its username and password is
+/// signed in (uses the network), and only the refresh token is kept; the password is dropped.
+/// Any other account is returned as it is.
+pub fn sign_in(mut secret: AccountSecret, net: &Net) -> Result<AccountSecret> {
+    if secret.provider != "opendrive" || secret.config.get("refresh_token").is_some() {
+        return Ok(secret);
+    }
+    let login: OpenDriveLogin = config(&secret)?;
+    let mut c = crate::opendrive::login(login.api.as_deref(), &login.username, &login.password, net)?;
+    if let Some(folder) = login.folder.filter(|f| !f.is_empty()) {
+        c.folder = folder;
+    }
+    secret.config = serde_json::to_value(c).map_err(|e| CloudError::Corrupt(e.to_string()))?;
+    Ok(secret)
 }
 
 /// `secret` with the refresh token `provider` now uses (providers that rotate it), or `None`
@@ -97,6 +132,8 @@ mod tests {
         assert_eq!(open(&secret("s3", s3), false).unwrap().info().provider, "s3");
         let dav = serde_json::json!({"url": "https://dav.example/lc/", "user": "u", "password": "p"});
         assert_eq!(open(&secret("webdav", dav), false).unwrap().info().provider, "webdav");
+        let p = open(&secret("opendrive", serde_json::json!({"refresh_token": "r"})), false).unwrap();
+        assert_eq!((p.info().provider.as_str(), p.refresh_token()), ("opendrive", Some("r")));
         for kind in ["gdrive", "onedrive", "dropbox"] {
             let p = open(&secret(kind, serde_json::json!({"client_id": "c", "refresh_token": "r"})), false).unwrap();
             assert_eq!(p.info().provider, kind);
@@ -105,6 +142,19 @@ mod tests {
         assert!(matches!(open(&secret("terabox", serde_json::json!({})), false), Err(CloudError::Unsupported(_))));
         assert!(open(&secret("gdrive", serde_json::json!({"client_id": 5})), false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_an_opendrive_login_is_signed_in() {
+        let net = Net::default();
+        let folder = secret("folder", serde_json::json!({"path": "/x"}));
+        assert_eq!(sign_in(folder.clone(), &net).unwrap(), folder);
+        let signed = secret("opendrive", serde_json::json!({"refresh_token": "r"}));
+        assert_eq!(sign_in(signed.clone(), &net).unwrap(), signed);
+        // a login with no password fails before any request
+        let r = sign_in(secret("opendrive", serde_json::json!({"username": "u", "password": ""})), &net);
+        assert!(matches!(r, Err(CloudError::Denied(_))));
+        assert!(sign_in(secret("opendrive", serde_json::json!({"user": "u"})), &net).is_err());
     }
 
     #[test]

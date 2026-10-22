@@ -9,6 +9,8 @@ use std::net::TcpStream;
 
 use serde_json::Value;
 
+pub mod opendrive;
+
 pub fn decode(s: &str) -> String {
     let b = s.replace('+', " ");
     let b = b.as_bytes();

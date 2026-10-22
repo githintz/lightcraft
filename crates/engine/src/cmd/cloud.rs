@@ -25,6 +25,8 @@ use crate::{Result, Session};
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(600);
 /// Providers that sign in through the browser.
 const OAUTH: &[&str] = &["gdrive", "onedrive", "dropbox"];
+/// What `cloud.signIn` signs in to: the browser sign-ins, and OpenDrive with its password.
+const SIGN_IN: &[&str] = &["gdrive", "onedrive", "dropbox", "opendrive"];
 
 fn library_dir(s: &Session, c: &str) -> Result<PathBuf> {
     match &s.library {
@@ -174,6 +176,8 @@ fn add_account(s: &mut Session, p: &Value) -> Result<Value> {
     read_settings(p, &mut settings, C)?;
     let id = new_account_id().map_err(|e| bad(C, e))?;
     let secret = AccountSecret { id, provider: provider.to_string(), label, config };
+    // an OpenDrive account given by its password: exchanged for a token here, never stored
+    let secret = accounts::sign_in(secret, &Net::default()).map_err(|e| bad(C, e.to_string()))?;
     // make the app folder / bucket and read the quota: an account that doesn't work isn't added
     if super::bool_or(p, "check", true) {
         let mut opened = accounts::open(&secret, true).map_err(|e| bad(C, format!("the account doesn't work: {e}")))?;
@@ -273,7 +277,22 @@ fn oauth_config(provider: &str, client: &OAuthClient, refresh: String) -> Option
         "gdrive" => serde_json::to_value(lightcraft_cloud::gdrive::GoogleDriveConfig::new(client, refresh)).ok(),
         "onedrive" => serde_json::to_value(lightcraft_cloud::onedrive::OneDriveConfig::new(client, refresh)).ok(),
         "dropbox" => serde_json::to_value(lightcraft_cloud::dropbox::DropboxConfig::new(client, refresh)).ok(),
+        "opendrive" => {
+            let api = client.token_url.trim_end_matches("/oauth2/grant.json");
+            serde_json::to_value(lightcraft_cloud::opendrive::OpenDriveConfig::new(api, refresh)).ok()
+        }
         _ => None,
+    }
+}
+
+/// The account `p` signs in again to (`account`), checked: it exists and is of `provider`.
+fn sign_in_again(s: &Session, p: &Value, provider: &str, c: &str) -> Result<Option<String>> {
+    let Some(id) = str_param(p, "account") else { return Ok(None) };
+    let vault = s.cloud.vault.as_ref().ok_or_else(|| bad(c, "the cloud vault is locked"))?;
+    match vault.accounts.iter().find(|a| a.id == id) {
+        Some(a) if a.provider == provider => Ok(Some(id.to_string())),
+        Some(a) => Err(bad(c, format!("account {id:?} is a {} account, not {provider}", a.provider))),
+        None => Err(bad(c, format!("no account {id:?}"))),
     }
 }
 
@@ -282,7 +301,10 @@ fn sign_in(s: &mut Session, p: &Value) -> Result<Value> {
     let dir = library_dir(s, C)?;
     unlocked(s, C)?;
     let provider =
-        str_param(p, "provider").filter(|v| OAUTH.contains(v)).ok_or_else(|| bad(C, format!("`provider` is one of {}", OAUTH.join(", "))))?;
+        str_param(p, "provider").filter(|v| SIGN_IN.contains(v)).ok_or_else(|| bad(C, format!("`provider` is one of {}", SIGN_IN.join(", "))))?;
+    if provider == "opendrive" {
+        return sign_in_opendrive(s, p);
+    }
     let client_id = str_param(p, "clientId")
         .map(str::to_string)
         .or_else(|| s.cloud.settings.client_ids.get(provider).cloned())
@@ -295,7 +317,8 @@ fn sign_in(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let flow = LoopbackFlow::start(client.clone(), &mut OsRandom).map_err(|e| bad(C, e.to_string()))?;
     let label = str_param(p, "label").map(str::trim).filter(|l| !l.is_empty()).unwrap_or(provider).chars().take(100).collect();
-    let state = Arc::new(SignIn { provider: provider.to_string(), label, url: flow.authorize_url().to_string(), ..SignIn::default() });
+    let account = sign_in_again(s, p, provider, C)?;
+    let state = Arc::new(SignIn { provider: provider.to_string(), label, url: flow.authorize_url().to_string(), account, ..SignIn::default() });
     *state.client.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(client);
     let st = state.clone();
     std::thread::Builder::new()
@@ -314,13 +337,47 @@ fn sign_in(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"url": url, "note": "open the url in a browser; cloud.signInStatus says when the account is added"}))
 }
 
+/// OpenDrive's sign-in: the username and password are exchanged for tokens on a worker thread
+/// (no browser); the password goes no further.
+fn sign_in_opendrive(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "cloud.signIn";
+    let user = str_param(p, "username").map(str::trim).filter(|u| !u.is_empty()).ok_or_else(|| bad(C, "missing `username` (or email)"))?;
+    let pass = str_param(p, "password").filter(|p| !p.is_empty()).ok_or_else(|| bad(C, "missing `password`"))?;
+    let api = str_param(p, "api").map(str::to_string).or_else(|| s.cloud.opendrive_api.clone());
+    let client =
+        OAuthClient::opendrive(format!("{}/oauth2/grant.json", api.as_deref().unwrap_or("https://dev.opendrive.com/api/v1").trim_end_matches('/')));
+    if let Some(old) = s.cloud.sign_in.take() {
+        old.cancel.store(true, Ordering::Relaxed);
+    }
+    // the username tells two OpenDrive accounts apart
+    let label = str_param(p, "label").map(str::trim).filter(|l| !l.is_empty()).unwrap_or(user).chars().take(100).collect();
+    let account = sign_in_again(s, p, "opendrive", C)?;
+    let state = Arc::new(SignIn { provider: "opendrive".into(), label, account, ..SignIn::default() });
+    *state.client.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(client);
+    let st = state.clone();
+    let (user, pass) = (user.to_string(), pass.to_string());
+    std::thread::Builder::new()
+        .name("lc-cloud-signin".into())
+        .spawn(move || {
+            let net = Net { cancel: st.cancel.clone(), ..Net::default() };
+            let r = lightcraft_cloud::opendrive::login(api.as_deref(), &user, &pass, &net).map(|c| c.refresh_token);
+            *st.result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r.map_err(|e| e.to_string()));
+        })
+        .map_err(|e| bad(C, format!("could not start the sign-in: {e}")))?;
+    s.cloud.sign_in = Some(state);
+    Ok(json!({"note": "signing in; cloud.signInStatus says when the account is added"}))
+}
+
 fn sign_in_status(s: &mut Session, _: &Value) -> Result<Value> {
     const C: &str = "cloud.signInStatus";
     let Some(si) = s.cloud.sign_in.clone() else { return Ok(Value::Null) };
     let base = json!({"provider": si.provider, "url": si.url});
     let Some(result) = lock_result(&si) else { return Ok(merge(base, json!({"state": "waiting"}))) };
     if si.taken.swap(true, Ordering::Relaxed) {
-        return Ok(merge(base, json!({"state": if result.is_ok() { "added" } else { "failed" }, "error": result.err()})));
+        return Ok(merge(
+            base,
+            json!({"state": match (&result, &si.account) { (Err(_), _) => "failed", (Ok(_), Some(_)) => "updated", (Ok(_), None) => "added" }, "error": result.err()}),
+        ));
     }
     match result {
         Err(e) => Ok(merge(base, json!({"state": "failed", "error": e}))),
@@ -328,6 +385,21 @@ fn sign_in_status(s: &mut Session, _: &Value) -> Result<Value> {
             let dir = library_dir(s, C)?;
             let client = si.client.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().ok_or_else(|| bad(C, "sign-in state lost"))?;
             let config = oauth_config(&si.provider, &client, refresh).ok_or_else(|| bad(C, "unknown provider"))?;
+            if let Some(id) = &si.account {
+                // the same account signed in again: new credentials, the folder it uses kept
+                let vault = s.cloud.vault.as_mut().ok_or_else(|| bad(C, "the cloud vault is locked"))?;
+                let secret = vault.accounts.iter_mut().find(|a| &a.id == id).ok_or_else(|| bad(C, format!("no account {id:?}")))?;
+                if let (Some(old), Value::Object(new)) = (secret.config.as_object_mut(), config) {
+                    for (k, v) in new {
+                        if k != "folder" && k != "root" {
+                            old.insert(k, v);
+                        }
+                    }
+                }
+                s.cloud.quotas.remove(id);
+                s.cloud.save_vault(&dir).map_err(|e| bad(C, e))?;
+                return Ok(merge(base, json!({"state": "updated", "account": id})));
+            }
             let id = new_account_id().map_err(|e| bad(C, e))?;
             let secret = AccountSecret { id, provider: si.provider.clone(), label: si.label.clone(), config };
             let added = add_secret(s, &dir, secret, AccountSettings::default(), C)?;
@@ -510,7 +582,7 @@ pub fn specs() -> Vec<CommandSpec> {
         }),
         cmd!(query "cloud.changePassphrase", "Change Cloud Passphrase", [], None, "{old, new}", always, change_passphrase),
         cmd!(query "cloud.addAccount", "Add Storage Account", [], None, "{provider: folder|s3|webdav|gdrive|onedrive|dropbox, config, label?, cap?, speed?, priority?, acceptsUploads?, check?: true} — folder {path}; s3 {endpoint, region, bucket, prefix, access_key, secret_key, path_style}; webdav {url, user, password}; OAuth providers {client_id, refresh_token, …} (or cloud.signIn). With check (default) the app folder / bucket is made and the quota read (network) → {id}", always, add_account),
-        cmd!(query "cloud.signIn", "Sign In to a Storage Account", [], None, "{provider: gdrive|onedrive|dropbox, clientId?, clientSecret?, label?} — start a browser sign-in (PKCE, loopback redirect) → {url}; the account is added when cloud.signInStatus sees it finished", always, sign_in),
+        cmd!(query "cloud.signIn", "Sign In to a Storage Account", [], None, "{provider: gdrive|onedrive|dropbox, clientId?, clientSecret?, label?} — start a browser sign-in (PKCE, loopback redirect) → {url}; {provider: opendrive, username, password, label?} — sign in with the password (kept nowhere); the account is added when cloud.signInStatus sees it finished; with `account: id`, that account signs in again (its id kept)", always, sign_in),
         cmd!(query "cloud.signInStatus", "Storage Sign-In Status", [], None, "{} → {state: waiting|added|failed, provider, url, account?, error?} | null", always, sign_in_status),
         cmd!(query "cloud.setAccount", "Storage Account Settings", [], None, "{id, label?, cap?: bytes|null, speed?: archive|slow|standard|fast, priority?: 0–1, acceptsUploads?}", always, set_account),
         cmd!(query "cloud.removeAccount", "Remove Storage Account", [], None, "{id} — forget the account (files on it stay)", always, remove_account),

@@ -25,6 +25,8 @@ serde_json = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
+# the fake OpenDrive server shared with lightcraft-cloud's tests checks uploads by MD5
+md-5 = "0.10"
 lightcraft-denoise = { workspace = true, features = ["runtime"] }
 lightcraft-codecs = { workspace = true }
 lightcraft-faces = { workspace = true }

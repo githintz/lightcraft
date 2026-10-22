@@ -3053,6 +3053,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hmac",
  "lightcraft-fetch",
+ "md-5",
  "quick-xml 0.38.4",
  "serde",
  "serde_json",
@@ -3170,6 +3171,7 @@ dependencies = [
  "lightcraft-segment",
  "lightcraft-tiff",
  "log",
+ "md-5",
  "miniz_oxide 0.8.9",
  "rayon",
  "serde",
@@ -3395,6 +3397,7 @@ dependencies = [
  "lightcraft-preview",
  "lightcraft-raster",
  "log",
+ "md-5",
  "serde",
  "serde_json",
  "toml",
@@ -3503,6 +3506,16 @@ checksum = "8ea1f30cedd69f0a2954655f7188c6a834246d2bcf1e315e2ac40c4b24dc9519"
 dependencies = [
  "cfg-if",
  "rayon",
+]
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
 ]
 
 [[package]]

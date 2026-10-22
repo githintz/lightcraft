@@ -1,6 +1,6 @@
 # Distributed cloud storage (proposal)
 
-**Status:** proposal; phase 1 (core crate `crates/cloud`) done; phase 2 (network providers) done: S3-compatible, WebDAV, Google Drive, OneDrive and Dropbox; phase 3 (backup and
+**Status:** proposal; phase 1 (core crate `crates/cloud`) done; phase 2 (network providers) done: S3-compatible, WebDAV, Google Drive, OneDrive, Dropbox and OpenDrive; phase 3 (backup and
 restore) done: `cloud.*` commands (CLI, control channel, MCP) and Settings ▸ Cloud. Opt-in; nothing changes for a library
 that doesn't turn it on. The local library stays the source of truth.
 
@@ -83,7 +83,7 @@ What each kind of file asks for by default:
 |---|---|---|
 | **0. Format spec** | [`cloud-format.md`](cloud-format.md): blob naming, encryption, manifest; shared with Storage Distributor | Both projects reference one spec |
 | **1. Core crate** (done) | `crates/cloud`: availability, placement (+ ported tests), `Provider` trait, content-addressed blobs, folder + memory providers, contract checks, segmented AES-256-GCM blob encryption, the Argon2id passphrase vault, the manifest (per-field last-writer-wins merge, snapshots, op logs) | Contract checks pass for every provider; no UI |
-| **2. Network providers** (done) | S3-compatible (`crates/cloud/src/s3.rs`: B2, R2, Wasabi, MinIO…; SigV4 written from the spec, checked against AWS's published examples and botocore), WebDAV (`crates/cloud/src/webdav.rs`: Nextcloud, ownCloud, NAS; basic auth only over https or to this computer), Google Drive (`crates/cloud/src/gdrive.rs`), OneDrive (`crates/cloud/src/onedrive.rs`), Dropbox (`crates/cloud/src/dropbox.rs`), see below. Sign-in for consumer drives: `crates/cloud/src/oauth.rs`, the authorization code flow with PKCE (RFC 7636) and a loopback redirect (RFC 8252), no LightCraft server. Later: S3 multipart upload above 5 GiB | Contract checks pass against local test servers (moto for S3, WsgiDAV with and without auth; fakes of Drive, Graph and Dropbox in `tests/`) |
+| **2. Network providers** (done) | S3-compatible (`crates/cloud/src/s3.rs`: B2, R2, Wasabi, MinIO…; SigV4 written from the spec, checked against AWS's published examples and botocore), WebDAV (`crates/cloud/src/webdav.rs`: Nextcloud, ownCloud, NAS; basic auth only over https or to this computer), Google Drive (`crates/cloud/src/gdrive.rs`), OneDrive (`crates/cloud/src/onedrive.rs`), Dropbox (`crates/cloud/src/dropbox.rs`), OpenDrive (`crates/cloud/src/opendrive.rs`), see below. Sign-in for consumer drives: `crates/cloud/src/oauth.rs`, the authorization code flow with PKCE (RFC 7636) and a loopback redirect (RFC 8252), no LightCraft server. Later: S3 multipart upload above 5 GiB | Contract checks pass against local test servers (moto for S3, WsgiDAV with and without auth; fakes of Drive, Graph, Dropbox and OpenDrive in `tests/`) |
 | **3. Backup (one-way)** (engine done) | Push originals, catalog snapshots and smart previews; restore a whole library on another machine. `crates/cloud/src/backup.rs` (the fleet: placement, encrypted blobs, the manifest on every account, restore, prune), `crates/cloud/src/accounts.rs` (a vault's accounts opened by kind), `crates/engine/src/cloud.rs` + `crates/engine/src/cmd/cloud.rs` (`cloud.*` commands, worker-thread jobs), `crates/ui-egui/src/panels/cloud.rs` (Settings ▸ Cloud). Next: Info ▸ "Stored on"; S3, WebDAV and restore in the UI | A library restored from the accounts alone matches the original (`crates/engine/src/tests_cloud.rs`) |
 | **4. Offload originals** | Availability per album / photo; "Free up local space"; an offloaded original is fetched on demand while its smart preview is shown; ties into Missing Photos | Edit and export a photo whose original is only in the cloud |
 | **5. Several devices** | First one writer at a time (a remote lease next to `catalog.lock`: "checked out on MacBook"); later per-op device id + Lamport clock and per-op merge rules | Two machines take turns on one library; later edit at once |
@@ -142,6 +142,38 @@ What each kind of file asks for by default:
 - **Errors:** 429 and 5xx retried with `Retry-After`; `insufficient_space` is "the storage account is full";
   `not_found` on delete is not an error.
 
+### OpenDrive
+
+- **Sign-in:** OpenDrive offers only the OAuth 2.0 *password* grant (RFC 6749 §4.3, partner id `OpenDrive`): the
+  username (or email) and password are exchanged once, on a worker thread, for an access token (24 h) and a refresh
+  token, and the password is dropped; it is never stored, journaled or sent anywhere else. No app registration is
+  needed. Accounts with two-factor authentication: not yet tried.
+- **Refresh tokens last 30 days and rotate:** every refresh hands out a new one and the old one stops working at once.
+  Each job (backup, Check Accounts, restore) refreshes, and the new token is saved to the vault in the library and,
+  after a backup, to the vault on every account. So the sign-in lasts as long as LightCraft backs up or checks at least
+  every 30 days; and when another computer uses the account (a restore, a second device), this one's token stops
+  working. Settings ▸ Cloud then shows **Sign In Again** on the account (`cloud.signIn` with `account`), which keeps
+  the account's id, so its files stay part of the backup.
+- **Layout:** a private folder in the account's root (`LightCraft` by default, `folder` in the config; parents are
+  made as needed), objects as files under it by path (`blobs/ab/<id>.bin`, real subfolders); the `RemoteRef` is the
+  object name, resolved with `file/idbypath`. Folders are made with `folder_is_public: 0` (OpenDrive makes root folders
+  hidden, i.e. downloadable by link, unless told otherwise).
+- **Uploads:** `create_file` → `open_file_upload` → `upload_file_chunk2` (8 MiB chunks, in order) →
+  `close_file_upload` with the file's MD5, which OpenDrive checks. `create_file` makes the file entry before any data
+  arrives, so the data goes to a hidden `.lc-upload-<name>` (never a valid object name, so never listed) and is renamed
+  into place when complete; replacing an object deletes the old file just before the rename. A failed upload removes
+  its temporary file, and the next upload of the same name clears one an interrupted run left. A chunk whose answer
+  was lost is resent and OpenDrive's `Incorrect chunk offset: uploaded=N` says where to go on. When OpenDrive already
+  holds the content (`RequireHashOnly`), nothing is sent. `RequireCompression` is ignored, as rclone does; the MD5
+  check at close would catch a server that needed it.
+- **Errors:** 401 refreshes the token once; 423 (a chunk still being written), 429 and 5xx are retried with backoff;
+  "Storage exceeded …" is "the storage account is full"; 509 is the daily bandwidth limit. The access token goes in
+  the query string (OpenDrive's API wants it there); error messages never include the address.
+- **Quota:** `users/info`: `StorageUsed` in bytes; `MaxStorage` is read as MB (the guide doesn't say; rclone reads it
+  the same way). Not yet checked against a real account.
+- **Reference:** OpenDrive's REST API guide 1.2.0 (opendrive.com/api). rclone's OpenDrive backend (MIT) was read for
+  the `MaxStorage` unit only; no code was taken from it.
+
 ### Signing in by hand
 
 `cargo run -p lightcraft-cloud --example cloud-signin -- gdrive|onedrive|dropbox <client id> [<secret>]` opens the
@@ -154,8 +186,9 @@ written from Google's public REST documentation.
 ## Using it (phase 3)
 
 Everything is a command, so the CLI, the control channel and MCP drive it; **Settings ▸ Cloud** calls the same ones:
-set up or unlock with the passphrase, add a folder (the folder picker) or sign in to Google Drive / OneDrive / Dropbox
-in the browser (with the client id of an app registration), a size limit per account, copies of originals, smart
+set up or unlock with the passphrase, add a folder (the folder picker), sign in to Google Drive / OneDrive / Dropbox
+in the browser (with the client id of an app registration) or to OpenDrive with its username and password, Sign In
+Again on an account whose sign-in stopped working, a size limit per account, copies of originals, smart
 previews on or off, Back Up Now with progress and Stop, Check Accounts, Lock. S3 and WebDAV accounts and restoring a
 library are commands only for now. None of them is journaled (they carry passphrases and credentials).
 
@@ -163,7 +196,8 @@ library are commands only for now. None of them is journaled (they carry passphr
 cloud.setup        {passphrase}                         a new vault (data key, no accounts) in <library>/cloud/
 cloud.unlock       {passphrase}   cloud.lock {}          cloud.changePassphrase {old, new}
 cloud.addAccount   {provider: folder|s3|webdav, config, label, cap?, speed?, priority?}
-cloud.signIn       {provider: gdrive|onedrive|dropbox, clientId}  → {url}; cloud.signInStatus adds the account
+cloud.signIn       {provider: gdrive|onedrive|dropbox, clientId, account?}  → {url}; cloud.signInStatus adds the account
+                   {provider: opendrive, username, password, account?}   (account: sign in again, its id kept)
 cloud.setAccount   {id, label?, cap?, speed?, priority?, acceptsUploads?}    cloud.removeAccount {id}
 cloud.configure    {originalCopies?: 1–8, smartPreviews?, clientIds?}
 cloud.backup       {wait?}        cloud.progress {}      cloud.cancel {}      cloud.refresh {wait?}
@@ -197,7 +231,7 @@ cloud.status       {}
 ## Testing
 
 `cargo test -p lightcraft-cloud` and `cargo test -p lightcraft-engine tests_cloud` run everything offline: the provider contract against the memory and folder
-providers and fakes of Google Drive, Microsoft Graph and Dropbox (with dropped chunks, lost answers, rate limits,
+providers and fakes of Google Drive, Microsoft Graph, Dropbox and OpenDrive (with dropped chunks, lost answers, rate limits,
 expired and rotated tokens, hostile addresses and the sign-in redirect), SigV4 against fixed vectors, the HTTP client against a local echo server. `tests/live.rs` runs the same
 contract against real servers, only when one is configured:
 
@@ -210,7 +244,8 @@ LIGHTCRAFT_TEST_WEBDAV=http://127.0.0.1:8081/ \
 `LIGHTCRAFT_TEST_S3_KEY` / `_SECRET` / `_REGION` and `LIGHTCRAFT_TEST_WEBDAV_USER` / `_PASSWORD` set credentials.
 `LIGHTCRAFT_TEST_GDRIVE_CLIENT_ID` / `_CLIENT_SECRET` / `_REFRESH_TOKEN` run it against a real Google account (in a new
 folder in My Drive per run); `LIGHTCRAFT_TEST_ONEDRIVE_CLIENT_ID` / `_REFRESH_TOKEN` against OneDrive (the app folder
-must be empty); `LIGHTCRAFT_TEST_DROPBOX_CLIENT_ID` / `_REFRESH_TOKEN` against Dropbox (a new subfolder per run). Any
+must be empty); `LIGHTCRAFT_TEST_DROPBOX_CLIENT_ID` / `_REFRESH_TOKEN` against Dropbox (a new subfolder per run);
+`LIGHTCRAFT_TEST_OPENDRIVE_USER` / `_PASSWORD` against OpenDrive (a new folder under `LightCraft-tests/` per run). Any
 S3-compatible server works (MinIO, Garage, moto: `moto_server -p 5055`); any WebDAV server (WsgiDAV:
 `wsgidav --port 8081 --root <dir> --auth anonymous`). Each run writes to a fresh app folder.
 

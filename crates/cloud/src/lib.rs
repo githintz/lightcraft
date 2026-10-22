@@ -44,6 +44,8 @@ mod net;
 pub mod oauth;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod onedrive;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod opendrive;
 pub mod placement;
 mod provider;
 #[cfg(not(target_arch = "wasm32"))]

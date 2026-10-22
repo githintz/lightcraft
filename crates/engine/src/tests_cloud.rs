@@ -1,7 +1,7 @@
 //! Cloud backup end to end with folder accounts: set up, connect, back up (and again: nothing
 //! re-sent), restore on "another machine" into a new folder, the restored library opening with
 //! its edits and originals relinked; wrong passphrases, unplugged accounts and secrets kept out
-//! of the journal.
+//! of the journal. OpenDrive end to end against the fake server of `lightcraft-cloud`'s tests.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::Session;
+
+#[path = "../../cloud/tests/common/mod.rs"]
+mod fake_http;
 
 fn temp_dir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("lc-cloud-{tag}-{}", std::process::id()));
@@ -232,6 +235,94 @@ fn backup_on_a_worker_thread_reports_progress_and_can_be_cancelled() {
 
     drop(s);
     for d in [lib, src, acc1, acc2] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// Wait for an OpenDrive (or browser) sign-in to end; its final state.
+fn wait_for_sign_in(s: &mut Session) -> Value {
+    let start = std::time::Instant::now();
+    loop {
+        let st = s.execute("cloud.signInStatus", &Value::Null).unwrap();
+        if st["state"] != "waiting" {
+            return st;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(30), "the sign-in never ended");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn opendrive_signs_in_with_its_password_backs_up_and_restores() {
+    use fake_http::opendrive::{PASS as OD_PASS, USER, start};
+    let (state, api) = start();
+    let (mut s, lib, src, acc1, acc2) = backed_up_library("opendrive");
+    for id in s.execute("cloud.status", &Value::Null).unwrap()["accounts"].as_array().unwrap().iter().map(|a| a["id"].clone()).collect::<Vec<_>>() {
+        s.execute("cloud.removeAccount", &json!({ "id": id })).unwrap();
+    }
+
+    // a wrong password adds nothing
+    s.execute("cloud.signIn", &json!({"provider": "opendrive", "username": USER, "password": "nope", "api": api})).unwrap();
+    let st = wait_for_sign_in(&mut s);
+    assert_eq!(st["state"], "failed", "{st}");
+    assert!(st["error"].as_str().unwrap().contains("refused"), "{st}");
+    s.execute("cloud.signIn", &json!({"provider": "opendrive", "username": USER, "password": OD_PASS, "api": api, "label": "OpenDrive"})).unwrap();
+    let st = wait_for_sign_in(&mut s);
+    assert_eq!(st["state"], "added", "{st}");
+    // only the refresh token is kept: no password in the vault, the journal or the settings
+    let account = s.cloud.vault.as_ref().unwrap().accounts[0].clone();
+    assert_eq!(account.provider, "opendrive");
+    assert!(account.config.get("password").is_none() && account.config.get("username").is_none(), "{:?}", account.config);
+    assert!(s.journal.iter().all(|(id, p)| !id.starts_with("cloud.") && !p.to_string().contains(OD_PASS)));
+    assert!(!std::fs::read_to_string(lib.join("cloud/settings.json")).unwrap().contains(OD_PASS));
+    s.execute("cloud.setAccount", &json!({"id": account.id, "cap": 50_000_000u64})).unwrap();
+
+    let r = s.execute("cloud.backup", &json!({"wait": true})).unwrap();
+    assert_eq!((r["failed"].as_u64(), r["error"].is_null()), (Some(0), true), "{r}");
+    assert!(r["stored"].as_u64().unwrap() >= 6, "{r}");
+
+    // the sign-in ran out (30 days unused, or another device used it): Check Accounts says so, and
+    // signing in again fixes the same account, which keeps its id and its files
+    state.lock().unwrap().refresh = "expired".into();
+    s.execute("cloud.refresh", &json!({"wait": true})).unwrap();
+    let st = s.execute("cloud.status", &Value::Null).unwrap();
+    assert!(st["accounts"][0]["error"].as_str().unwrap_or_default().contains("sign in again"), "{st}");
+    let wrong = s.execute("cloud.signIn", &json!({"provider": "dropbox", "clientId": "c", "account": account.id}));
+    assert!(wrong.is_err(), "an account signs in again only with its own provider");
+    s.execute("cloud.signIn", &json!({"provider": "opendrive", "username": USER, "password": OD_PASS, "api": api, "account": account.id})).unwrap();
+    assert_eq!(wait_for_sign_in(&mut s)["state"], "updated");
+    let st = s.execute("cloud.status", &Value::Null).unwrap();
+    assert_eq!(st["accounts"].as_array().unwrap().len(), 1, "{st}");
+    assert_eq!(st["accounts"][0]["id"], account.id.as_str());
+    assert!(st["accounts"][0]["error"].is_null(), "{st}");
+    let r = s.execute("cloud.backup", &json!({"wait": true})).unwrap();
+    assert_eq!((r["failed"].as_u64(), r["error"].is_null(), r["stored"].as_u64()), (Some(0), true, Some(0)), "{r}");
+    // OpenDrive replaced its refresh token while backing up: the vault holds the one that works
+    let live = state.lock().unwrap().refresh.clone();
+    assert_eq!(s.cloud.vault.as_ref().unwrap().accounts[0].config["refresh_token"], live.as_str());
+    drop(s);
+
+    // another machine: the password and the passphrase bring the library back
+    let restored = temp_dir("opendrive-restored");
+    std::fs::remove_dir_all(&restored).unwrap();
+    let mut other = Session::new().with_fs();
+    let r = other
+        .execute(
+            "cloud.restore",
+            &json!({"dir": restored.to_string_lossy(), "provider": "opendrive", "config": {"username": USER, "password": OD_PASS, "api": api}, "passphrase": PASS, "wait": true}),
+        )
+        .unwrap();
+    assert_eq!((r["library"]["photos"].as_u64(), r["library"]["missing"].as_u64()), (Some(4), Some(0)), "{r}");
+    assert!(!std::fs::read(restored.join("cloud/vault.enc")).unwrap().windows(OD_PASS.len()).any(|w| w == OD_PASS.as_bytes()));
+    // and keeps backing up there: its vault has the token the restore left working
+    other.execute("cloud.unlock", &json!({ "passphrase": PASS })).unwrap();
+    let r = other.execute("cloud.backup", &json!({"wait": true})).unwrap();
+    assert_eq!((r["failed"].as_u64(), r["error"].is_null()), (Some(0), true), "{r}");
+    // the originals are already there; only what names the new folder and device changed
+    assert!(r["unchanged"].as_u64().unwrap() >= 4 && r["stored"].as_u64().unwrap() <= 2, "{r}");
+
+    drop(other);
+    for d in [lib, src, acc1, acc2, restored] {
         let _ = std::fs::remove_dir_all(d);
     }
 }

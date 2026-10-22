@@ -89,6 +89,20 @@ impl OAuthClient {
         }
     }
 
+    /// OpenDrive's own accounts (partner id [`crate::opendrive::CLIENT_ID`]), whose only grant is
+    /// [`password_grant`]; `token_url` is under the API root.
+    pub fn opendrive(token_url: impl Into<String>) -> OAuthClient {
+        OAuthClient {
+            auth_url: String::new(),
+            token_url: token_url.into(),
+            client_id: crate::opendrive::CLIENT_ID.into(),
+            client_secret: None,
+            scopes: Vec::new(),
+            extra_auth_params: Vec::new(),
+            redirect_port: None,
+        }
+    }
+
     /// Dropbox, for an app registered with "App folder" access ([`crate::dropbox::SCOPES`]).
     /// Dropbox matches redirect URIs exactly, so the app's registration must list
     /// `http://127.0.0.1:<redirect_port>`.
@@ -361,6 +375,17 @@ pub fn exchange_code(client: &OAuthClient, net: &Net, code: &str, verifier: &str
     }
     let tokens = token_request(client, net, &pairs)?;
     if tokens.refresh_token.is_none() {
+        return Err(CloudError::Denied("the provider gave no refresh token, so LightCraft couldn't stay signed in".into()));
+    }
+    Ok(tokens)
+}
+
+/// Tokens for a username and password: the OAuth 2.0 password grant (RFC 6749 §4.3), only for
+/// providers that offer nothing else (OpenDrive). The password is sent once and never kept.
+pub fn password_grant(client: &OAuthClient, net: &Net, username: &str, password: &str) -> Result<Tokens> {
+    let pairs = [("grant_type", "password"), ("client_id", client.client_id.as_str()), ("username", username), ("password", password)];
+    let tokens = token_request(client, net, &pairs)?;
+    if tokens.refresh_token.as_deref().is_none_or(str::is_empty) {
         return Err(CloudError::Denied("the provider gave no refresh token, so LightCraft couldn't stay signed in".into()));
     }
     Ok(tokens)

@@ -140,6 +140,8 @@ pub struct SignIn {
     pub provider: String,
     pub label: String,
     pub url: String,
+    /// Signing in again to this account: its credentials are replaced and its id kept.
+    pub account: Option<String>,
     pub client: Mutex<Option<lightcraft_cloud::oauth::OAuthClient>>,
     pub result: Mutex<Option<std::result::Result<String, String>>>,
     pub cancel: Arc<AtomicBool>,
@@ -150,6 +152,9 @@ pub struct SignIn {
 /// The library's cloud state in this session.
 #[derive(Default)]
 pub struct CloudState {
+    /// OpenDrive's API root for sign-ins that don't name one (tests point it at a local fake);
+    /// `None`: OpenDrive's own.
+    pub opendrive_api: Option<String>,
     /// The unlocked vault (`None` while locked or not set up).
     pub vault: Option<Vault>,
     /// Kept while unlocked, to seal the vault again when accounts change.
@@ -515,6 +520,9 @@ pub fn run_restore(plan: RestorePlan, job: &CloudJob) -> Result<(), String> {
     if plan.dir.join("catalog.snap").exists() || plan.dir.join("catalog.log").exists() {
         return Err(format!("{} already holds a library; restore into a new folder", plan.dir.display()));
     }
+    // an OpenDrive account given by its password is signed in first (the password goes no further)
+    let source = accounts::sign_in(plan.source, &lightcraft_cloud::Net::default()).map_err(|e| format!("can't sign in to the account: {e}"))?;
+    let plan = RestorePlan { source, ..plan };
     let mut source = accounts::open(&plan.source, false).map_err(|e| format!("can't open the account: {e}"))?;
     let listed = source.list().map_err(|e| format!("can't list the account: {e}"))?;
     let find = |name: &str| listed.iter().find(|l| l.name.as_str() == name).map(|l| l.remote.clone());
@@ -584,11 +592,13 @@ pub fn run_restore(plan: RestorePlan, job: &CloudJob) -> Result<(), String> {
         return Err("the backup holds no catalog".into());
     }
 
-    // the restored library keeps backing up to the same accounts
+    // the restored library keeps backing up to the same accounts, with the credentials as they
+    // are now: refresh tokens the restore rotated (OpenDrive replaces its own on every use)
     let mut vault = vault;
     if let Some(s) = vault.accounts.iter_mut().find(|a| a.id == source_id) {
         s.config = plan.source.config.clone();
     }
+    collect_updates(&fleet, &mut vault, job);
     let sealed = vault.seal(&plan.passphrase, VaultParams::default(), &mut OsRandom).map_err(|e| e.to_string())?;
     write_atomic(&dir(&plan.dir).join(VAULT_FILE), &sealed).map_err(|e| e.to_string())?;
     let mut restored_settings = entries

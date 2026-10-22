@@ -21,4 +21,6 @@ thiserror = { workspace = true }
 # network providers and the OS random source: native only (the web host brings its own)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 getrandom = { version = "0.2", features = ["std"] }
+# OpenDrive checks each upload against its MD5
+md-5 = "0.10"
 lightcraft-fetch = { workspace = true }
